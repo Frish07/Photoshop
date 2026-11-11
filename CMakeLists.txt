@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(PixelForge VERSION 1.1.0 LANGUAGES CXX RC)
+project(PixelForge VERSION 1.2.0 LANGUAGES CXX RC)
 
 if(NOT WIN32)
     message(FATAL_ERROR "PixelForge requires Windows 10 or 11.")
@@ -7,7 +7,7 @@ endif()
 
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
-add_library(pixelforge_core STATIC src/document.cpp src/formats.cpp src/psd.cpp)
+add_library(pixelforge_core STATIC src/document.cpp src/selection.cpp src/formats.cpp src/psd.cpp)
 target_include_directories(pixelforge_core PUBLIC src)
 target_compile_features(pixelforge_core PUBLIC cxx_std_20)
 target_compile_definitions(pixelforge_core PUBLIC UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)

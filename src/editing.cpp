@@ -25,6 +25,18 @@ std::vector<Field> fieldsFor(Adjustment a) {
         {L"Saturation (−100 to 100)", std::to_wstring(a.second)}, {L"Lightness (−100 to 100)", std::to_wstring(a.third)}};
     return {{L"Brightness (−100 to 100)", std::to_wstring(a.first)}, {L"Contrast (−100 to 100)", std::to_wstring(a.second)}};
 }
+std::wstring hexColor(Pixel color) {
+    constexpr wchar_t digits[] = L"0123456789ABCDEF";
+    std::wstring result = L"#000000";
+    for (int i = 0; i < 6; ++i) result[6 - i] = digits[(color >> (4 * i)) & 15];
+    return result;
+}
+Pixel effectColor(const std::wstring& input, int opacity) {
+    const auto color = input.starts_with(L'#') ? input.substr(1) : input;
+    if (color.size() != 6 || color.find_first_not_of(L"0123456789abcdefABCDEF") != std::wstring::npos)
+        throw std::runtime_error("Enter a six-digit RGB color, such as #203040.");
+    return Pixel(std::stoul(color, nullptr, 16)) | (Pixel((opacity * 255 + 50) / 100) << 24);
+}
 } // namespace
 
 void App::createDocument() {
@@ -34,6 +46,94 @@ void App::createDocument() {
     ++created_;
     addTab(blankDocument(options->width, options->height, options->ppi, options->background), options->name, L"New Document");
 }
+
+void App::setScreenMode(int mode) {
+    if (screenMode_ == mode) return;
+    if (screenMode_ == 0) {
+        standardPlacement_.length = sizeof(standardPlacement_);
+        if (!GetWindowPlacement(window_, &standardPlacement_)) return;
+    }
+    screenMode_ = mode;
+    if (mode == 0) {
+        SetWindowLongPtrW(window_, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
+        SetWindowPlacement(window_, &standardPlacement_);
+        SetWindowPos(window_, nullptr, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED);
+    } else {
+        MONITORINFO monitor{};
+        monitor.cbSize = sizeof(monitor);
+        if (!GetMonitorInfoW(MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST), &monitor)) return;
+        const auto rect = monitor.rcMonitor;
+        SetWindowLongPtrW(window_, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+        SetWindowPos(window_, HWND_TOP, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, SWP_FRAMECHANGED);
+    }
+    repaint();
+}
+
+std::optional<int> App::nearestGuide(Vec p) const {
+    if (guidesLocked_ || !showGuides_ || !showExtras_ || !tab() || !inside(imageRect(), p)) return std::nullopt;
+    const auto& guides = tab()->doc.state().guides;
+    std::optional<int> result;
+    float distance = 5;
+    for (std::size_t i = 0; i < guides.size(); ++i) {
+        const auto guide = guides[i];
+        const auto target = guide.vertical ? imageToScreen(float(guide.position), 0).x : imageToScreen(0, float(guide.position)).y;
+        const float delta = std::abs(target - (guide.vertical ? p.x : p.y));
+        if (delta < distance) { distance = delta; result = int(i); }
+    }
+    return result;
+}
+
+void App::startGuide(bool vertical, std::optional<int> existing, Vec p) {
+    if (!tab() || guidesLocked_) return;
+    if (!existing && tab()->doc.state().guides.size() >= maxGuides) { MessageBeep(MB_ICONWARNING); return; }
+    const auto location = screenToImage(p);
+    guideDraft_ = {vertical, int(std::round(vertical ? location.x : location.y))};
+    movingGuide_ = existing;
+    showGuides_ = true;
+    showExtras_ = true;
+    drag_ = Drag::guide;
+    down_ = last_ = p;
+    SetCapture(window_);
+    repaint();
+}
+
+void App::finishGuide(Vec p) {
+    auto& doc = tab()->doc;
+    auto& state = doc.edit();
+    const bool place = inside(viewport_, p) && guideDraft_.position >= 0 &&
+        guideDraft_.position <= (guideDraft_.vertical ? state.width : state.height);
+    if (!place && !movingGuide_) return;
+    if (movingGuide_ && *movingGuide_ >= int(state.guides.size())) return;
+    doc.begin();
+    if (movingGuide_) state.guides.erase(state.guides.begin() + *movingGuide_);
+    if (place && std::find(state.guides.begin(), state.guides.end(), guideDraft_) == state.guides.end())
+        state.guides.push_back(guideDraft_);
+    doc.commit(place ? L"Position Guide" : L"Remove Guide");
+    documentChanged(false);
+}
+
+Point App::snappedMove(Rect from, Point offset) const {
+    if (!snap_ || !tab() || (GetKeyState(VK_CONTROL) & 0x8000)) return offset;
+    const auto& state = tab()->doc.state();
+    const int threshold = int(std::ceil(6.0f / tab()->zoom));
+    auto snapAxis = [&](int position, int extent, int delta, bool vertical, int span) {
+        const std::array edges{position + delta, position + delta + extent / 2, position + delta + extent};
+        int correction = 0, distance = threshold + 1;
+        auto consider = [&](int target) {
+            for (const int edge : edges) {
+                const int candidate = target - edge;
+                if (std::abs(candidate) < distance) { correction = candidate; distance = std::abs(candidate); }
+            }
+        };
+        for (const int target : {0, span / 2, span}) consider(target);
+        if (showExtras_ && showGuides_) for (const auto guide : state.guides)
+            if (guide.vertical == vertical) consider(guide.position);
+        return delta + correction;
+    };
+    return {snapAxis(from.x, from.w, offset.x, true, state.width), snapAxis(from.y, from.h, offset.y, false, state.height)};
+}
+
+Point App::snappedPoint(Point point) const { return snappedMove({0, 0, 0, 0}, point); }
 
 void App::adjustment(std::optional<AdjustmentKind> kind) {
     auto t = tab();
@@ -84,7 +184,46 @@ void App::dab(float x, float y, Rect& dirty) {
     const Brush brush{foreground_, float(brushSize_), hardness_ / 100.0f, flow_ / 100.0f,
         tool_ == Tool::eraser, t->mask};
     const CloneSample source{doc.beforeEdit(), cloneOffset_, cloneMerged_};
-    dirty = unite(dirty, stamp(doc.active(), clip(), x, y, brush, tool_ == Tool::clone ? &source : nullptr));
+    dirty = unite(dirty, stamp(doc.active(), clip(), x, y, brush, tool_ == Tool::clone ? &source : nullptr, selection()));
+}
+void App::layerStyle(Command command) {
+    auto& doc = tab()->doc;
+    auto& layer = doc.active();
+    if (layer.locked || layer.adjustment) { MessageBeep(MB_ICONWARNING); return; }
+    auto style = layer.style;
+    if (command == Command::clearStyle) {
+        if (style.empty()) return;
+        style = {};
+    } else {
+        const bool stroke = command == Command::strokeStyle, shadow = command == Command::shadowStyle;
+        auto& color = stroke ? style.stroke : shadow ? style.shadow : style.overlay;
+        const auto title = stroke ? L"Stroke" : shadow ? L"Drop Shadow" : L"Color Overlay";
+        const bool enabled = alpha(color) != 0;
+        const auto initialColor = enabled ? color : shadow ? rgba(0, 0, 0, 153) :
+            stroke ? rgba(0, 0, 0) : rgba(78, 132, 224);
+        std::vector<Field> fields{{L"Color (#RRGGBB)", hexColor(initialColor)},
+            {L"Opacity (0–100, 0 disables)", std::to_wstring((alpha(initialColor) * 100 + 127) / 255)}};
+        if (stroke) fields.push_back({L"Outside size (1–64 px)", std::to_wstring(enabled ? style.strokeWidth : 3)});
+        if (shadow) {
+            fields.push_back({L"Angle (−180° to 180°)", std::to_wstring(enabled ? style.shadowAngle : 120)});
+            fields.push_back({L"Distance (0–512 px)", std::to_wstring(enabled ? style.shadowDistance : 10)});
+            fields.push_back({L"Size (0–128 px)", std::to_wstring(enabled ? style.shadowRadius : 12)});
+        }
+        const auto input = prompt(window_, title, fields);
+        if (!input) return;
+        const int opacity = readNumber((*input)[1], 0, 100);
+        color = opacity ? effectColor((*input)[0], opacity) : 0;
+        if (stroke) style.strokeWidth = opacity ? readNumber((*input)[2], 1, 64) : 0;
+        if (shadow) {
+            style.shadowAngle = opacity ? readNumber((*input)[2], -180, 180) : 0;
+            style.shadowDistance = opacity ? readNumber((*input)[3], 0, 512) : 0;
+            style.shadowRadius = opacity ? readNumber((*input)[4], 0, 128) : 0;
+        }
+    }
+    doc.begin();
+    layer.style = style;
+    doc.commit(command == Command::clearStyle ? L"Clear Layer Style" : L"Layer Style");
+    documentChanged();
 }
 
 void App::beginTransform() {
@@ -194,8 +333,9 @@ void App::dragTransform(Vec p) {
         return;
     }
     if (transformHandle_ < 0) {
-        transform.box.x = bounded(original.x + dx);
-        transform.box.y = bounded(original.y + dy);
+        const auto delta = snappedMove(original, {int(std::round(dx)), int(std::round(dy))});
+        transform.box.x = bounded(original.x + delta.x);
+        transform.box.y = bounded(original.y + delta.y);
         return;
     }
     const auto direction = directions[transformHandle_];

@@ -6,7 +6,9 @@
 
 namespace pf {
 namespace {
-constexpr std::array<std::string_view, 7> blends{"norm", "mul ", "scrn", "over", "dark", "lite", "diff"};
+constexpr std::array<std::string_view, 26> blends{"norm", "mul ", "scrn", "over", "dark", "lite", "diff",
+    "idiv", "lbrn", "div ", "lddg", "sLit", "hLit", "vLit", "lLit", "pLit", "hMix", "smud", "fsub", "fdiv",
+    "dkCl", "lgCl", "hue ", "sat ", "colr", "lum "};
 constexpr auto psdLimit = 2ull * 1024 * 1024 * 1024 - 1;
 
 struct Channel {
@@ -17,6 +19,9 @@ struct Channel {
 struct Record {
     Layer layer;
     Rect bounds;
+    std::optional<Rect> maskBounds;
+    int maskDefault = 255;
+    bool maskInverted = false;
     std::vector<Channel> channels;
     bool complex{};
 };
@@ -27,9 +32,8 @@ std::uint64_t section(Reader& file, std::uint64_t length, std::uint64_t end) {
     require(file.pos() <= end && length <= end - file.pos(), "Invalid PSD section length.");
     return file.pos() + length;
 }
-double readResolution(Reader& in) {
+void readResources(Reader& in, State& state) {
     const auto end = section(in, in.u32(), in.limit());
-    double ppi = 72;
     while (in.pos() + 12 <= end && in.str(4) == "8BIM") {
         const auto id = in.u16();
         const auto name = in.u8();
@@ -38,13 +42,24 @@ double readResolution(Reader& in) {
         const auto blockEnd = section(in, size, end);
         if (id == 1005 && size >= 16) {
             const auto resolution = in.u32() / 65536.0;
-            if (resolution >= 1 && resolution <= 2400) ppi = resolution;
+            if (resolution >= 1 && resolution <= 2400) state.ppi = resolution;
+        }
+        if (id == 1032 && size >= 16 && in.u32() == 1) {
+            in.skip(8);
+            const auto count = in.u32();
+            if (count <= maxGuides - state.guides.size() && count <= (size - 16) / 5) {
+                for (std::uint32_t i = 0; i < count; ++i) {
+                    const int position = int(std::round(in.u32() / 32.0));
+                    const auto direction = in.u8();
+                    if (direction <= 1 && position <= (direction == 0 ? state.width : state.height))
+                        state.guides.push_back({direction == 0, position});
+                }
+            }
         }
         in.seek(blockEnd);
         if (size % 2 && in.pos() < end) in.skip(1);
     }
     in.seek(end);
-    return ppi;
 }
 Rect rectangle(Reader& in) {
     const int top = in.i32(), left = in.i32(), bottom = in.i32(), right = in.i32();
@@ -69,8 +84,17 @@ Record readRecord(Reader& in, std::uint64_t end) {
     rec.layer.visible = (flags & 2) == 0;
     in.skip(1);
     auto extra = section(in, in.u32(), end);
-    auto mask = section(in, in.u32(), extra);
-    if (mask != in.pos()) rec.complex = true;
+    const auto maskLength = in.u32();
+    const auto mask = section(in, maskLength, extra);
+    if (maskLength == 20) {
+        rec.maskBounds = rectangle(in);
+        rec.maskDefault = in.u8();
+        const auto flags = in.u8();
+        rec.layer.maskEnabled = !(flags & 2);
+        rec.maskInverted = (flags & 4) != 0;
+        rec.complex |= (flags & ~7) != 0 || (rec.maskDefault != 0 && rec.maskDefault != 255);
+        if (rec.maskInverted) rec.maskDefault = 255 - rec.maskDefault;
+    } else if (maskLength) rec.complex = true;
     in.seek(mask);
     auto ranges = section(in, in.u32(), extra);
     in.seek(ranges);
@@ -95,10 +119,11 @@ Record readRecord(Reader& in, std::uint64_t end) {
             }
         }
         if (key == "lspf" && length >= 4) rec.layer.locked = (in.u32() & 7) != 0;
-        constexpr std::array<std::string_view, 26> complexKeys{"lsct", "lsdk", "TySh", "tySh", "SoLd", "SoLE",
+        if (key == "iOpa" && length >= 1) rec.layer.fillOpacity = in.u8();
+        constexpr std::string_view complexKeys[]{"lsct", "lsdk", "TySh", "tySh", "SoLd", "SoLE",
             "PlLd", "vmsk", "vsms", "vogk", "vstk", "lfx2", "lrFX", "levl", "curv", "brit", "hue2", "blnc",
-            "vibA", "expA", "selc", "mixr", "grdm", "SoCo", "GdFl", "PtFl"};
-        rec.complex |= std::find(complexKeys.begin(), complexKeys.end(), key) != complexKeys.end();
+            "vibA", "expA", "selc", "mixr", "grdm", "SoCo", "GdFl", "PtFl", "blwh", "phfl", "clrL", "nvrt", "post", "thrs"};
+        rec.complex |= std::find(std::begin(complexKeys), std::end(complexKeys), key) != std::end(complexKeys);
         in.seek(dataEnd);
         if (length % 2 && in.pos() < extra) in.skip(1);
     }
@@ -142,7 +167,7 @@ void unpack(std::span<const std::uint8_t> input, std::span<std::uint8_t> out) {
     require(j == out.size(), "Incomplete PSD scanline.");
 }
 void loadBands(Reader& in, Plane& destination, int width, int height,
-    const std::array<std::optional<PlaneReader>, 4>& channels, bool gray) {
+    const std::array<std::optional<PlaneReader>, 4>& channels, bool gray, Point origin = {}, bool inverted = false) {
     constexpr int batch = 24;
     std::vector<std::uint8_t> band(std::size_t(width) * batch);
     std::vector<std::uint8_t> packed;
@@ -167,41 +192,54 @@ void loadBands(Reader& in, Plane& destination, int width, int height,
                 }
             }
             for (int i = 0; i < count; ++i) {
-                if (gray && c == 0) pixels[i] |= Pixel(band[i]) * 0x010101;
+                if (gray && c == 0) pixels[i] |= Pixel(inverted ? 255 - band[i] : band[i]) * 0x010101;
                 else if (c == 3) pixels[i] = (pixels[i] & 0xffffffu) | (Pixel(band[i]) << 24);
                 else pixels[i] |= Pixel(band[i]) << (16 - c * 8);
             }
         }
-        importPixels(destination, {0, y, width, lines}, pixels, width);
+        importPixels(destination, {origin.x, origin.y + y, width, lines}, pixels, width);
     }
+}
+PlaneReader loadChannel(Reader& in, const Channel& channel, int width, int height) {
+    require(channel.size >= 2, "Invalid PSD layer channel.");
+    in.seek(channel.offset);
+    const int compression = in.u16();
+    require(compression < 2, "This PSD uses ZIP-compressed layers. Save with a compatible merged preview or use 8-bit RLE.");
+    auto source = table(in, height, width, compression, channel.offset + channel.size);
+    if (source.rle) {
+        section(in, std::uint64_t(height) * 2, channel.offset + channel.size);
+        auto offset = in.pos() + std::uint64_t(height) * 2;
+        for (int row = 0; row < height; ++row) {
+            source.rows[row] = offset;
+            offset += in.u16();
+        }
+        require(offset <= channel.offset + channel.size, "Invalid PSD RLE offsets.");
+        source.rows[height] = offset;
+    }
+    return source;
 }
 void loadLayer(Reader& in, Record& rec, bool gray) {
     const auto [x, y, width, height] = rec.bounds;
-    if (!width || !height) return;
-    std::array<std::optional<PlaneReader>, 4> sources;
-    for (const auto& ch : rec.channels) {
-        const int c = ch.id == -1 ? 3 : ch.id;
-        if (c < 0 || c > (gray ? 0 : 2)) {
-            if (ch.id != -1) continue;
+    if (width && height) {
+        std::array<std::optional<PlaneReader>, 4> sources;
+        for (const auto& channel : rec.channels) {
+            if (channel.id == -1 || (channel.id >= 0 && channel.id <= (gray ? 0 : 2)))
+                sources[channel.id == -1 ? 3 : channel.id] = loadChannel(in, channel, width, height);
         }
-        require(ch.size >= 2, "Invalid PSD layer channel.");
-        in.seek(ch.offset);
-        const int compression = in.u16();
-        require(compression < 2, "This PSD uses ZIP-compressed layers. Save with a compatible merged preview or use 8-bit RLE.");
-        auto source = table(in, height, width, compression, ch.offset + ch.size);
-        if (source.rle) {
-            section(in, std::uint64_t(height) * 2, ch.offset + ch.size);
-            auto offset = in.pos() + std::uint64_t(height) * 2;
-            for (int row = 0; row < height; ++row) {
-                source.rows[row] = offset;
-                offset += in.u16();
-            }
-            require(offset <= ch.offset + ch.size, "Invalid PSD RLE offsets.");
-            source.rows[height] = offset;
-        }
-        sources[c] = std::move(source);
+        loadBands(in, rec.layer.pixels, width, height, sources, gray);
     }
-    loadBands(in, rec.layer.pixels, width, height, sources, gray);
+    if (rec.maskBounds) {
+        const auto bounds = *rec.maskBounds;
+        const auto bg = rec.maskDefault;
+        rec.layer.mask.emplace(rgba(bg, bg, bg));
+        if (!bounds.empty()) {
+            const auto channel = std::find_if(rec.channels.begin(), rec.channels.end(), [](const Channel& ch) { return ch.id == -2; });
+            require(channel != rec.channels.end(), "The PSD mask channel is missing.");
+            std::array<std::optional<PlaneReader>, 4> sources;
+            sources[0] = loadChannel(in, *channel, bounds.w, bounds.h);
+            loadBands(in, *rec.layer.mask, bounds.w, bounds.h, sources, true, {bounds.x - x, bounds.y - y}, rec.maskInverted);
+        }
+    }
 }
 State merged(Reader& in, State state, int channels, bool gray, bool hasAlpha) {
     const int compression = in.u16();
@@ -241,20 +279,30 @@ State merged(Reader& in, State state, int channels, bool gray, bool hasAlpha) {
 std::size_t psdNameLength(const Layer& layer) { return std::min<std::size_t>(255, layer.name.size()); }
 std::uint32_t extraSize(const Layer& layer) {
     const auto pascal = (psdNameLength(layer) + 4) & ~std::size_t(3);
-    return std::uint32_t(8 + pascal + 12 + 4 + layer.name.size() * 2 + (layer.locked ? 16 : 0));
+    return std::uint32_t(8 + pascal + 12 + 4 + layer.name.size() * 2 + (layer.locked ? 16 : 0) +
+        (layer.mask ? 20 : 0) + (layer.fillOpacity != 255 ? 16 : 0));
 }
-void writeRecord(Writer& out, const Layer& layer, Rect bounds) {
+void writeRecord(Writer& out, const Layer& layer, Rect bounds, Rect mask) {
     out.u32(bounds.y); out.u32(bounds.x); out.u32(bounds.bottom()); out.u32(bounds.right());
-    out.u16(4);
+    out.u16(layer.mask ? 5 : 4);
     for (int id : {-1, 0, 1, 2}) {
         out.u16(std::uint16_t(id));
         out.u32(2 + std::uint32_t(bounds.w) * bounds.h);
+    }
+    if (layer.mask) {
+        out.u16(std::uint16_t(-2));
+        out.u32(2 + std::uint32_t(mask.w) * mask.h);
     }
     out.str("8BIM");
     out.str(blends[std::size_t(layer.blend)]);
     out.u8(std::uint8_t(layer.opacity)); out.u8(0); out.u8(layer.visible ? 0 : 2); out.u8(0);
     out.u32(extraSize(layer));
-    out.u32(0); out.u32(0);
+    if (layer.mask) {
+        out.u32(20);
+        out.u32(mask.y); out.u32(mask.x); out.u32(mask.bottom()); out.u32(mask.right());
+        out.u8(std::uint8_t(red(layer.mask->background()))); out.u8(layer.maskEnabled ? 0 : 2); out.u16(0);
+    } else out.u32(0);
+    out.u32(0);
     const auto n = psdNameLength(layer);
     out.u8(std::uint8_t(n));
     for (std::size_t i = 0; i < n; ++i) out.u8(layer.name[i] < 128 ? std::uint8_t(layer.name[i]) : '?');
@@ -263,6 +311,7 @@ void writeRecord(Writer& out, const Layer& layer, Rect bounds) {
     out.u32(std::uint32_t(layer.name.size()));
     for (auto ch : layer.name) out.u16(std::uint16_t(ch));
     if (layer.locked) { out.str("8BIMlspf"); out.u32(4); out.u32(7); }
+    if (layer.fillOpacity != 255) { out.str("8BIMiOpa"); out.u32(4); out.u8(std::uint8_t(layer.fillOpacity)); out.u8(0); out.u16(0); }
 }
 } // namespace
 
@@ -279,7 +328,7 @@ State loadPsd(const std::filesystem::path& path) {
         state.width <= maxEdge && state.height <= maxEdge &&
         std::uint64_t(state.width) * state.height <= maxDecodedPixels, "PSD dimensions exceed the decoding limit.");
     in.skip(in.u32());
-    state.ppi = readResolution(in);
+    readResources(in, state);
     const auto layerEnd = section(in, in.u32(), in.limit());
     bool hasAlpha = false;
     std::vector<Record> records;
@@ -296,6 +345,10 @@ State loadPsd(const std::filesystem::path& path) {
                 for (int i = 0; i < count; ++i) {
                     auto rec = readRecord(in, infoEnd);
                     pixels += std::uint64_t(rec.bounds.w) * rec.bounds.h;
+                    if (rec.maskBounds) {
+                        pixels += std::uint64_t(rec.maskBounds->w) * rec.maskBounds->h;
+                        supported &= rec.maskBounds->w <= maxEdge && rec.maskBounds->h <= maxEdge;
+                    }
                     supported &= !rec.complex && rec.bounds.w <= maxEdge && rec.bounds.h <= maxEdge &&
                         pixels <= maxDecodedPixels;
                     records.push_back(std::move(rec));
@@ -303,7 +356,8 @@ State loadPsd(const std::filesystem::path& path) {
                 for (auto& rec : records) for (auto& channel : rec.channels) {
                     channel.offset = in.pos();
                     auto end = section(in, channel.size, infoEnd);
-                    if (channel.size >= 2 && in.u16() > 1 && channel.id >= -1 && channel.id <= 2) supported = false;
+                    if (channel.size >= 2 && in.u16() > 1 && channel.id >= -2 && channel.id <= 2) supported = false;
+                    if (channel.id == -3 || (channel.id == -2 && !rec.maskBounds && channel.size > 2)) supported = false;
                     in.seek(end);
                 }
             }
@@ -322,7 +376,7 @@ State loadPsd(const std::filesystem::path& path) {
     return merged(in, std::move(state), channels, mode == 1, hasAlpha);
 }
 void savePsd(const State& state, const std::filesystem::path& path) {
-    std::vector<Rect> bounds;
+    std::vector<Rect> bounds, masks;
     std::uint64_t layerInfo = 2;
     for (auto i = state.layers.rbegin(); i != state.layers.rend(); ++i) {
         auto extent = i->pixels.extent();
@@ -330,22 +384,39 @@ void savePsd(const State& state, const std::filesystem::path& path) {
         auto area = intersect(extent, state.bounds());
         if (area.empty()) area = {};
         bounds.push_back(area);
+        Rect mask;
+        if (i->mask) {
+            auto extent = i->mask->extent();
+            extent.x += i->x; extent.y += i->y;
+            mask = intersect(extent, state.bounds());
+            if (mask.empty()) mask = {0, 0, 1, 1};
+            layerInfo += 6 + 2 + std::uint64_t(mask.w) * mask.h;
+        }
+        masks.push_back(mask);
         layerInfo += 58 + extraSize(*i) + 4 * (2 + std::uint64_t(area.w) * area.h);
     }
     const auto rounded = (layerInfo + 1) & ~1ull;
-    require(rounded + 78 + 4ull * state.width * state.height <= psdLimit, "This export would exceed the 2 GB PSD limit.");
+    const auto guideBytes = state.guides.empty() ? 0u : std::uint32_t(16 + state.guides.size() * 5);
+    const auto guideResource = guideBytes ? 12 + guideBytes + (guideBytes % 2) : 0;
+    require(rounded + 78 + guideResource + 4ull * state.width * state.height <= psdLimit, "This export would exceed the 2 GB PSD limit.");
     Writer out(path);
     out.str("8BPS"); out.u16(1);
     for (int i = 0; i < 6; ++i) out.u8(0);
     out.u16(4); out.u32(state.height); out.u32(state.width); out.u16(8); out.u16(3);
-    out.u32(0); out.u32(28);
+    out.u32(0); out.u32(28 + guideResource);
     out.str("8BIM"); out.u16(1005); out.u16(0); out.u32(16);
     const auto resolution = std::uint32_t(std::round(state.ppi * 65536));
     for (int axis = 0; axis < 2; ++axis) { out.u32(resolution); out.u16(1); out.u16(1); }
+    if (guideBytes) {
+        out.str("8BIM"); out.u16(1032); out.u16(0); out.u32(guideBytes);
+        out.u32(1); out.u32(576); out.u32(576); out.u32(std::uint32_t(state.guides.size()));
+        for (const auto guide : state.guides) { out.u32(guide.position * 32); out.u8(guide.vertical ? 0 : 1); }
+        if (guideBytes % 2) out.u8(0);
+    }
     out.u32(std::uint32_t(rounded + 8)); out.u32(std::uint32_t(rounded));
     out.u16(std::uint16_t(-int(state.layers.size())));
     for (std::size_t i = 0; i < bounds.size(); ++i)
-        writeRecord(out, state.layers[state.layers.size() - 1 - i], bounds[i]);
+        writeRecord(out, state.layers[state.layers.size() - 1 - i], bounds[i], masks[i]);
     std::vector<std::uint8_t> row(state.width);
     for (std::size_t i = 0; i < bounds.size(); ++i) {
         const auto& layer = state.layers[state.layers.size() - 1 - i];
@@ -357,21 +428,27 @@ void savePsd(const State& state, const std::filesystem::path& path) {
                 int previous = -1'000'000;
                 const auto ty = tileIndex(ly);
                 const Tile* tile = nullptr;
-                const Tile* mask = nullptr;
                 for (int x = 0; x < area.w; ++x) {
                     const int lx = x + area.x - layer.x;
                     const auto tx = tileIndex(lx);
                     if (previous != tx) {
                         previous = tx;
                         tile = layer.pixels.tile({tx, ty});
-                        mask = layer.mask ? layer.mask->tile({tx, ty}) : nullptr;
                     }
                     const int offset = (ly - ty * tileEdge) * tileEdge + lx - tx * tileEdge;
                     const auto p = tile ? tile->px[offset] : 0;
-                    const int value = get(p);
-                    row[x] = std::uint8_t(mask && get == alpha ? (value * red(mask->px[offset]) + 127) / 255 : value);
+                    row[x] = std::uint8_t(get(p));
                 }
                 out.bytes(row.data(), area.w);
+            }
+        }
+        if (layer.mask) {
+            const auto mask = masks[i];
+            out.u16(0);
+            for (int y = mask.y; y < mask.bottom(); ++y) {
+                for (int x = 0; x < mask.w; ++x)
+                    row[x] = std::uint8_t(red(layer.mask->pixel(mask.x + x - layer.x, y - layer.y)));
+                out.bytes(row.data(), mask.w);
             }
         }
     }

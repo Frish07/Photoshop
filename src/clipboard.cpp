@@ -57,6 +57,19 @@ void App::copy(bool cut, bool merged) {
         composite(doc.state(), area, pixels, area.w);
         for (auto& p : pixels) p = straight(p);
     }
+    if (const auto selected = selection()) {
+        for (int y = 0; y < area.h; ++y) {
+            auto* row = pixels.data() + std::size_t(y) * area.w;
+            Run scratch;
+            int x = area.x;
+            for (const auto span : selected->row(y + area.y, scratch)) {
+                const int first = std::clamp(span.first, area.x, area.right()), last = std::clamp(span.last, area.x, area.right());
+                if (first > x) std::fill(row + x - area.x, row + first - area.x, 0);
+                x = std::max(x, last);
+            }
+            std::fill(row + x - area.x, row + area.w, 0);
+        }
+    }
     {
         Clipboard clipboard(window_);
         require(EmptyClipboard(), "Unable to empty the clipboard.");
@@ -64,7 +77,7 @@ void App::copy(bool cut, bool merged) {
     }
     if (cut) {
         doc.begin();
-        fill(doc.active(), area, 0xffffffff, true, t->mask);
+        fill(doc.active(), area, 0xffffffff, true, t->mask, selection());
         doc.commit(L"Cut");
         documentChanged();
     }

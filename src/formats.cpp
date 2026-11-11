@@ -9,7 +9,7 @@
 namespace pf {
 namespace {
 namespace fs = std::filesystem;
-constexpr std::string_view signature = "PXFORGE3";
+constexpr std::string_view signature = "PXFORGE4";
 constexpr std::size_t projectTileLimit = (1024ull << 20) / sizeof(Tile);
 constexpr std::size_t projectReferenceLimit = 1'000'000;
 
@@ -134,16 +134,28 @@ Plane readPlane(Reader& in, Pixel background, std::vector<std::shared_ptr<Tile>>
 State readProject(const fs::path& path) {
     Reader in(path);
     const auto magic = in.str(signature.size());
-    require(magic == signature || magic == "PXFORGE2" || magic == "PXFORGE1", "Invalid PixelForge project.");
+    require(magic == signature || magic == "PXFORGE3" || magic == "PXFORGE2" || magic == "PXFORGE1", "Invalid PixelForge project.");
+    const bool styled = magic == signature;
+    const bool adjustments = styled || magic == "PXFORGE3";
     State state;
     state.width = in.i32();
     state.height = in.i32();
     const auto count = in.u16();
     state.active = in.u16();
-    if (magic == signature) state.ppi = in.u32() / 1000.0;
+    if (adjustments) state.ppi = in.u32() / 1000.0;
     require(state.width > 0 && state.height > 0 && state.width <= maxEdge && state.height <= maxEdge &&
         count > 0 && count <= maxLayers && state.active < count && state.ppi >= 1 && state.ppi <= 2400,
         "Invalid project dimensions, resolution or layer count.");
+    if (styled) {
+        const auto guides = in.u16();
+        require(guides <= maxGuides, "Too many document guides.");
+        for (int i = 0; i < guides; ++i) {
+            const auto direction = in.u8();
+            const int position = in.i32();
+            require(direction <= 1 && position >= 0 && position <= (direction ? state.width : state.height), "Invalid document guide.");
+            state.guides.push_back({direction != 0, position});
+        }
+    }
     std::size_t remainingReferences = projectReferenceLimit;
     std::vector<std::shared_ptr<Tile>> dictionary;
     state.layers.reserve(count);
@@ -155,15 +167,25 @@ State readProject(const fs::path& path) {
         layer.blend = Blend(in.u8());
         const auto flags = in.u8();
         require(layer.x >= -maxEdge * 64 && layer.x <= maxEdge * 64 && layer.y >= -maxEdge * 64 &&
-            layer.y <= maxEdge * 64 && layer.blend <= Blend::difference && flags <= (magic == signature ? 15 : 7), "Invalid layer metadata.");
+            layer.y <= maxEdge * 64 && layer.blend <= (styled ? Blend::luminosity : Blend::difference) &&
+            flags <= (styled ? 63 : adjustments ? 15 : 7) && (!(flags & 32) || (flags & 4)), "Invalid layer metadata.");
         layer.visible = (flags & 1) != 0;
         layer.locked = (flags & 2) != 0;
+        layer.maskEnabled = !(flags & 32);
+        if (styled) layer.fillOpacity = in.u8();
         if (flags & 8) {
             layer.adjustment = Adjustment{AdjustmentKind(in.u8()), in.i32(), in.i32(), in.i32()};
             require(validAdjustment(*layer.adjustment), "Invalid adjustment layer settings.");
         }
+        if (flags & 16) {
+            layer.style = {in.u32(), in.u32(), in.u32(), in.u8(), in.u8(), in.u16(), in.i32()};
+            require(!layer.adjustment && validLayerStyle(layer.style), "Invalid layer style settings.");
+        }
         layer.pixels = readPlane(in, 0, dictionary, remainingReferences, magic != "PXFORGE1");
-        if (flags & 4) layer.mask = readPlane(in, 0xffffffff, dictionary, remainingReferences, magic != "PXFORGE1");
+        if (flags & 4) {
+            const int gray = styled ? in.u8() : 255;
+            layer.mask = readPlane(in, rgba(gray, gray, gray), dictionary, remainingReferences, magic != "PXFORGE1");
+        }
         state.layers.push_back(std::move(layer));
     }
     return state;
@@ -285,6 +307,9 @@ void save(const State& state, const fs::path& path) {
         out.u16(std::uint16_t(state.layers.size())); out.u16(std::uint16_t(state.active));
         require(std::isfinite(state.ppi) && state.ppi >= 1 && state.ppi <= 2400, "Invalid document resolution.");
         out.u32(std::uint32_t(std::round(state.ppi * 1000)));
+        require(state.guides.size() <= maxGuides, "Too many document guides.");
+        out.u16(std::uint16_t(state.guides.size()));
+        for (const auto guide : state.guides) { out.u8(guide.vertical ? 1 : 0); out.u32(guide.position); }
         std::unordered_map<const Tile*, std::uint32_t> dictionary;
         std::size_t remainingReferences = projectReferenceLimit;
         for (const auto& layer : state.layers) {
@@ -295,14 +320,26 @@ void save(const State& state, const fs::path& path) {
             out.u16(std::uint16_t(name.size())); out.str(name);
             out.u32(layer.x); out.u32(layer.y); out.u8(std::uint8_t(layer.opacity));
             out.u8(std::uint8_t(layer.blend));
-            out.u8(std::uint8_t((layer.visible ? 1 : 0) | (layer.locked ? 2 : 0) | (layer.mask ? 4 : 0) | (layer.adjustment ? 8 : 0)));
+            const auto& style = layer.style;
+            out.u8(std::uint8_t((layer.visible ? 1 : 0) | (layer.locked ? 2 : 0) | (layer.mask ? 4 : 0) |
+                (layer.adjustment ? 8 : 0) | (style.empty() ? 0 : 16) | (layer.mask && !layer.maskEnabled ? 32 : 0)));
+            out.u8(std::uint8_t(layer.fillOpacity));
             if (layer.adjustment) {
                 const auto& value = *layer.adjustment;
                 require(validAdjustment(value), "Invalid adjustment layer settings.");
                 out.u8(std::uint8_t(value.kind)); out.u32(value.first); out.u32(value.second); out.u32(value.third);
             }
+            if (!style.empty()) {
+                require(!layer.adjustment && validLayerStyle(style), "Invalid layer style settings.");
+                out.u32(style.overlay); out.u32(style.stroke); out.u32(style.shadow);
+                out.u8(std::uint8_t(style.strokeWidth)); out.u8(std::uint8_t(style.shadowRadius));
+                out.u16(std::uint16_t(style.shadowDistance)); out.u32(style.shadowAngle);
+            }
             writePlane(out, layer.pixels, dictionary, remainingReferences);
-            if (layer.mask) writePlane(out, *layer.mask, dictionary, remainingReferences);
+            if (layer.mask) {
+                out.u8(std::uint8_t(red(layer.mask->background())));
+                writePlane(out, *layer.mask, dictionary, remainingReferences);
+            }
         }
         out.close();
     });
@@ -311,11 +348,13 @@ void exportImage(const State& state, const fs::path& path) {
     const auto e = extension(path);
     if (e == L".psd") {
         atomicWrite(path, [&](const fs::path& temp) {
-            if (std::any_of(state.layers.begin(), state.layers.end(), [](const Layer& layer) { return bool(layer.adjustment); })) {
+            const auto requiresRaster = [](const Layer& layer) { return layer.adjustment || !layer.style.empty(); };
+            if (std::any_of(state.layers.begin(), state.layers.end(), requiresRaster)) {
                 State raster = state;
-                if (std::any_of(raster.layers.begin(), raster.layers.end(), [](const Layer& layer) { return layer.visible && layer.adjustment; }))
+                if (std::any_of(raster.layers.begin(), raster.layers.end(), [&](const Layer& layer) { return layer.visible && requiresRaster(layer); }))
                     mergeVisible(raster, false);
                 std::erase_if(raster.layers, [](const Layer& layer) { return bool(layer.adjustment); });
+                for (auto& layer : raster.layers) layer.style = {};
                 if (raster.layers.empty()) raster.layers.emplace_back();
                 savePsd(raster, temp);
             } else savePsd(state, temp);

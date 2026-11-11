@@ -14,7 +14,7 @@ $env:Path = "$Toolchain;$env:Path"
 $resource = Join-Path $build "app-res.o"
 $common = @("-std=c++20", "-O3", "-DNDEBUG", "-Wall", "-Wextra", "-Wpedantic", "-static", "-DUNICODE",
     "-D_UNICODE", "-DNOMINMAX", "-DWIN32_LEAN_AND_MEAN", "-D_WIN32_WINNT=0x0A00", "-Isrc")
-$core = @("src/document.cpp", "src/formats.cpp", "src/psd.cpp")
+$core = @("src/document.cpp", "src/selection.cpp", "src/formats.cpp", "src/psd.cpp")
 $gui = @("src/main.cpp", "src/app.cpp", "src/interface.cpp", "src/dialogs.cpp", "src/new_document.cpp", "src/clipboard.cpp", "src/editing.cpp", $resource)
 $codecs = @("-lole32", "-loleaut32", "-lwindowscodecs", "-luuid")
 Push-Location $project

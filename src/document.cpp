@@ -29,6 +29,8 @@ int luminance(Pixel c) {
 }
 
 int blendChannel(int s, int d, Blend mode) {
+    auto burn = [d](int source) { return d == 255 ? 255 : source == 0 ? 0 : 255 - std::min(255, (255 - d) * 255 / source); };
+    auto dodge = [d](int source) { return d == 0 ? 0 : source == 255 ? 255 : std::min(255, d * 255 / (255 - source)); };
     switch (mode) {
     case Blend::multiply: return mul255(s, d);
     case Blend::screen: return 255 - mul255(255 - s, 255 - d);
@@ -36,8 +38,64 @@ int blendChannel(int s, int d, Blend mode) {
     case Blend::darken: return std::min(s, d);
     case Blend::lighten: return std::max(s, d);
     case Blend::difference: return std::abs(s - d);
+    case Blend::colorBurn: return burn(s);
+    case Blend::linearBurn: return std::max(0, s + d - 255);
+    case Blend::colorDodge: return dodge(s);
+    case Blend::linearDodge: return std::min(255, s + d);
+    case Blend::softLight: {
+        const auto b = d / 255.0, a = s / 255.0;
+        const auto f = b <= 0.25 ? ((16 * b - 12) * b + 4) * b : std::sqrt(b);
+        return int(255 * (a <= 0.5 ? b - (1 - 2 * a) * b * (1 - b) : b + (2 * a - 1) * (f - b)) + 0.5);
+    }
+    case Blend::hardLight: return s < 128 ? mul255(2 * s, d) : 255 - mul255(2 * (255 - s), 255 - d);
+    case Blend::vividLight: return s < 128 ? burn(2 * s) : dodge(2 * s - 255);
+    case Blend::linearLight: return std::clamp(d + 2 * s - 255, 0, 255);
+    case Blend::pinLight: return s < 128 ? std::min(d, 2 * s) : std::max(d, 2 * s - 255);
+    case Blend::hardMix: return s + d >= 255 ? 255 : 0;
+    case Blend::exclusion: return s + d - mul255(2 * s, d);
+    case Blend::subtract: return std::max(0, d - s);
+    case Blend::divide: return s ? std::min(255, d * 255 / s) : 255;
     default: return s;
     }
+}
+
+Pixel blendColor(Pixel source, Pixel backdrop, Blend mode) {
+    if (mode < Blend::darkerColor) return rgba(blendChannel(red(source), red(backdrop), mode),
+        blendChannel(green(source), green(backdrop), mode), blendChannel(blue(source), blue(backdrop), mode));
+    using RGB = std::array<double, 3>;
+    auto decode = [](Pixel p) -> RGB { return {double(red(p)), double(green(p)), double(blue(p))}; };
+    const auto s = decode(source), b = decode(backdrop);
+    if (mode == Blend::darkerColor || mode == Blend::lighterColor) {
+        const double a = s[0] + s[1] + s[2], d = b[0] + b[1] + b[2];
+        return (mode == Blend::darkerColor ? a < d : a > d) ? source : backdrop;
+    }
+    auto lum = [](RGB v) { return 0.3 * v[0] + 0.59 * v[1] + 0.11 * v[2]; };
+    auto sat = [](RGB v) { const auto [lo, hi] = std::minmax_element(v.begin(), v.end()); return *hi - *lo; };
+    auto setLum = [&](RGB v, double l) {
+        const auto delta = l - lum(v);
+        for (auto& x : v) x += delta;
+        const auto [minIt, maxIt] = std::minmax_element(v.begin(), v.end());
+        const auto low = *minIt, high = *maxIt;
+        if (low < 0 && l > low) for (auto& x : v) x = l + (x - l) * l / (l - low);
+        if (high > 255 && high > l) for (auto& x : v) x = l + (x - l) * (255 - l) / (high - l);
+        return v;
+    };
+    auto setSat = [](RGB v, double saturation) {
+        std::array<int, 3> order{0, 1, 2};
+        std::sort(order.begin(), order.end(), [&](int a, int b) { return v[a] < v[b]; });
+        const auto [lo, mid, hi] = order;
+        if (v[hi] > v[lo]) {
+            v[mid] = (v[mid] - v[lo]) * saturation / (v[hi] - v[lo]);
+            v[hi] = saturation;
+        } else v[mid] = v[hi] = 0;
+        v[lo] = 0;
+        return v;
+    };
+    const auto result = mode == Blend::hue ? setLum(setSat(s, sat(b)), lum(b)) :
+        mode == Blend::saturation ? setLum(setSat(b, sat(s)), lum(b)) :
+        mode == Blend::color ? setLum(s, lum(b)) : setLum(b, lum(s));
+    auto byte = [](double v) { return std::clamp(int(v + 0.5), 0, 255); };
+    return rgba(byte(result[0]), byte(result[1]), byte(result[2]));
 }
 
 class AdjustmentMap {
@@ -61,12 +119,10 @@ public:
         const Pixel source = straight(current);
         const auto adjusted = value_.kind == AdjustmentKind::hueSaturation ? hue(source) :
             rgba(lookup_[red(source)], lookup_[green(source)], lookup_[blue(source)], a);
-        auto mix = [&](int before, int after) {
-            const auto mixed = blendChannel(after, before, mode);
-            return (before * (255 - opacity) + mixed * opacity + 127) / 255;
-        };
-        return premultiply(rgba(mix(red(source), red(adjusted)), mix(green(source), green(adjusted)),
-            mix(blue(source), blue(adjusted)), a));
+        const auto blended = mode == Blend::normal ? adjusted : blendColor(adjusted, source, mode);
+        auto mix = [&](int before, int after) { return (before * (255 - opacity) + after * opacity + 127) / 255; };
+        return premultiply(rgba(mix(red(source), red(blended)), mix(green(source), green(blended)),
+            mix(blue(source), blue(blended)), a));
     }
 
 private:
@@ -110,19 +166,36 @@ Pixel paint(Pixel dst, Pixel src, int opacity, bool erase, bool mask) {
 }
 
 template<class F>
-void modify(Plane& plane, Rect area, bool existingOnly, F operation) {
+void modify(Plane& plane, Rect area, bool existingOnly, F operation, const Selection* selection = nullptr, Point origin = {}) {
+    if (selection && selection->rectangular()) {
+        auto selected = selection->bounds();
+        selected.x -= origin.x; selected.y -= origin.y;
+        area = intersect(area, selected);
+        selection = nullptr;
+    }
     eachTile(area, [&](Coord coord, Rect clip) {
         const Tile* old = plane.tile(coord);
         if (existingOnly && !old) return;
         Tile* changed = nullptr;
-        for (int y = clip.y; y < clip.bottom(); ++y) {
-            for (int x = clip.x; x < clip.right(); ++x) {
+        auto span = [&](int y, int first, int last) {
+            for (int x = first; x < last; ++x) {
                 const int i = (y - coord.y * tileEdge) * tileEdge + x - coord.x * tileEdge;
                 const Pixel before = changed ? changed->px[i] : old ? old->px[i] : plane.background();
                 const Pixel after = operation(before, x, y);
                 if (before == after) continue;
                 if (!changed) changed = &plane.edit(coord);
                 changed->px[i] = after;
+            }
+        };
+        for (int y = clip.y; y < clip.bottom(); ++y) {
+            if (!selection) span(y, clip.x, clip.right());
+            else {
+                Run rectangular;
+                const auto runs = selection->row(y + origin.y, rectangular);
+                auto run = std::lower_bound(runs.begin(), runs.end(), clip.x + origin.x,
+                    [](Run a, int x) { return a.last <= x; });
+                for (; run != runs.end() && run->first < clip.right() + origin.x; ++run)
+                    span(y, std::max(clip.x, run->first - origin.x), std::min(clip.right(), run->last - origin.x));
             }
         }
     });
@@ -172,13 +245,16 @@ std::size_t estimate(const State& a, const State& b) {
 }
 
 bool same(const State& a, const State& b) {
-    if (a.width != b.width || a.height != b.height || a.ppi != b.ppi || a.layers.size() != b.layers.size()) return false;
+    if (a.width != b.width || a.height != b.height || a.ppi != b.ppi || a.guides != b.guides ||
+        a.layers.size() != b.layers.size()) return false;
     for (std::size_t i = 0; i < a.layers.size(); ++i) {
         const auto& x = a.layers[i];
         const auto& y = b.layers[i];
         if (x.name != y.name || x.x != y.x || x.y != y.y || x.opacity != y.opacity || x.blend != y.blend ||
             x.visible != y.visible || x.locked != y.locked || x.pixels.identity() != y.pixels.identity() ||
-            x.adjustment != y.adjustment || x.mask.has_value() != y.mask.has_value() ||
+            x.adjustment != y.adjustment || x.style != y.style || x.fillOpacity != y.fillOpacity ||
+            x.maskEnabled != y.maskEnabled ||
+            x.mask.has_value() != y.mask.has_value() ||
             (x.mask && x.mask->identity() != y.mask->identity())) return false;
     }
     return true;
@@ -259,6 +335,101 @@ private:
     TransformView view_;
     double c_, s_, centerX_, centerY_, scaleX_, scaleY_;
 };
+
+Pixel styledPixel(Pixel pixel, const Layer& layer) {
+    const int tint = alpha(layer.style.overlay);
+    if (!tint && layer.fillOpacity == 255) return pixel;
+    if (!alpha(pixel)) return 0;
+    const int base = mul255(layer.fillOpacity, 255 - tint), total = base + tint;
+    if (!total) return 0;
+    auto mix = [&](int source, int overlay) { return (source * base + overlay * tint + total / 2) / total; };
+    return rgba(mix(red(pixel), red(layer.style.overlay)), mix(green(pixel), green(layer.style.overlay)),
+        mix(blue(pixel), blue(layer.style.overlay)), mul255(alpha(pixel), total));
+}
+
+void layerEffects(const Layer& layer, Rect area, int step, int width, int height, std::span<Pixel> pixels, int stride,
+    const InverseTransform* transform = nullptr) {
+    if (!alpha(layer.style.shadow) && !alpha(layer.style.stroke)) return;
+    Coord previous{std::numeric_limits<int>::min(), std::numeric_limits<int>::min()};
+    const Tile* tile = nullptr;
+    const Tile* mask = nullptr;
+    const Plane* maskPlane = layer.mask && layer.maskEnabled ? &*layer.mask : nullptr;
+    const int maskDefault = maskPlane ? red(maskPlane->background()) : 255;
+    auto sourceAlpha = [&](int x, int y) {
+        if (transform) {
+            double px{}, py{};
+            if (!transform->map(x, y, px, py)) return 0;
+            x = int(std::round(px)); y = int(std::round(py));
+        }
+        x -= layer.x; y -= layer.y;
+        const Coord coord{tileIndex(x), tileIndex(y)};
+        if (coord != previous) {
+            previous = coord;
+            tile = layer.pixels.tile(coord);
+            mask = maskPlane ? maskPlane->tile(coord) : nullptr;
+        }
+        if (!tile) return 0;
+        const int i = (y - coord.y * tileEdge) * tileEdge + x - coord.x * tileEdge;
+        return mul255(alpha(tile->px[i]), mask ? red(mask->px[i]) : maskDefault);
+    };
+    auto render = [&](Pixel color, int radius, Point offset, bool stroke) {
+        const int h = height + 2 * radius;
+        const int length = std::max(width, height) + 2 * radius;
+        std::vector<std::uint8_t> horizontal(std::size_t(width) * h), input(length), temporary(length);
+        std::vector<int> queue(stroke ? length : 0);
+        auto reduce = [&](std::span<const std::uint8_t> row, int r, auto emit) {
+            const int window = 2 * r + 1, n = int(row.size());
+            if (stroke) {
+                int first = 0, last = 0;
+                for (int i = 0; i < n; ++i) {
+                    while (first < last && row[queue[last - 1]] <= row[i]) --last;
+                    queue[last++] = i;
+                    if (queue[first] <= i - window) ++first;
+                    if (i >= window - 1) emit(i - window + 1, row[queue[first]]);
+                }
+            } else {
+                int sum = 0;
+                for (int i = 0; i < window; ++i) sum += row[i];
+                for (int i = 0; i <= n - window; ++i) {
+                    emit(i, (sum + window / 2) / window);
+                    if (i < n - window) sum += row[i + window] - row[i];
+                }
+            }
+        };
+        auto filter = [&](int count, auto emit) {
+            auto row = std::span(input).first(std::size_t(count) + 2 * radius);
+            if (stroke || radius <= 1) reduce(row, radius, emit);
+            else {
+                const int inner = radius / 2;
+                reduce(row, inner, [&](int i, int a) { temporary[i] = std::uint8_t(a); });
+                reduce(std::span(temporary).first(row.size() - 2 * inner), radius - inner, emit);
+            }
+        };
+        const int originX = area.x + step / 2 - offset.x;
+        const int originY = area.y + step / 2 - offset.y;
+        for (int y = 0; y < h; ++y) {
+            const int gy = originY + (y - radius) * step;
+            for (int x = 0; x < width + 2 * radius; ++x)
+                input[x] = std::uint8_t(sourceAlpha(originX + (x - radius) * step, gy));
+            filter(width, [&](int x, int a) { horizontal[std::size_t(y) * width + x] = std::uint8_t(a); });
+        }
+        for (int x = 0; x < width; ++x) {
+            for (int y = 0; y < h; ++y) input[y] = horizontal[std::size_t(y) * width + x];
+            filter(height, [&](int y, int a) {
+                const int coverage = stroke ? std::max(0, a - sourceAlpha(originX + x * step, originY + y * step)) : a;
+                auto& out = pixels[std::size_t(y) * stride + x];
+                out = over(out, color, mul255(layer.opacity, coverage), stroke ? Blend::normal : Blend::multiply);
+            });
+        }
+    };
+    if (alpha(layer.style.shadow)) {
+        const auto radians = layer.style.shadowAngle * std::numbers::pi / 180;
+        const Point offset{int(std::round(-std::cos(radians) * layer.style.shadowDistance)),
+            int(std::round(std::sin(radians) * layer.style.shadowDistance))};
+        render(layer.style.shadow, (layer.style.shadowRadius + step / 2) / step, offset, false);
+    }
+    if (alpha(layer.style.stroke)) render(layer.style.stroke, (layer.style.strokeWidth + step - 1) / step, {}, true);
+}
 } // namespace
 
 Rect intersect(Rect a, Rect b) {
@@ -285,6 +456,11 @@ bool validAdjustment(const Adjustment& value) {
     return value.kind == AdjustmentKind::hueSaturation && value.first >= -180 && value.first <= 180 &&
         value.second >= -100 && value.second <= 100 && value.third >= -100 && value.third <= 100;
 }
+bool validLayerStyle(const LayerStyle& style) {
+    return style.strokeWidth >= (alpha(style.stroke) ? 1 : 0) && style.strokeWidth <= 64 &&
+        style.shadowRadius >= 0 && style.shadowRadius <= 128 && style.shadowDistance >= 0 && style.shadowDistance <= 512 &&
+        style.shadowAngle >= -180 && style.shadowAngle <= 180;
+}
 
 Pixel premultiply(Pixel c) {
     const int a = alpha(c);
@@ -303,13 +479,14 @@ Pixel over(Pixel d, Pixel s, int opacity, Blend mode) {
     if (sa == 255 && mode == Blend::normal) return s;
     const int da = alpha(d);
     const int a = sa + mul255(da, 255 - sa);
-    Pixel backdrop = mode == Blend::normal || da == 0 ? 0 : straight(d);
+    const bool blend = mode != Blend::normal && da != 0;
+    const Pixel result = blend ? blendColor(s, straight(d), mode) : s;
     auto channel = [&](int sc, int dc, int bc) {
-        const int mixed = backdrop ? mul255(sc, 255 - da) + mul255(blendChannel(sc, bc, mode), da) : sc;
+        const int mixed = blend ? mul255(sc, 255 - da) + mul255(bc, da) : sc;
         return std::min(a, mul255(mixed, sa) + mul255(dc, 255 - sa));
     };
-    return rgba(channel(red(s), red(d), red(backdrop)), channel(green(s), green(d), green(backdrop)),
-        channel(blue(s), blue(d), blue(backdrop)), a);
+    return rgba(channel(red(s), red(d), red(result)), channel(green(s), green(d), green(result)),
+        channel(blue(s), blue(d), blue(result)), a);
 }
 
 std::size_t CoordHash::operator()(Coord c) const {
@@ -387,23 +564,38 @@ State blankDocument(int width, int height, double ppi, Pixel background) {
     }
     return state;
 }
-Plane maskFromSelection(Rect canvas, const std::optional<Rect>& selection) {
+Plane maskFromSelection(Rect canvas, const std::optional<Selection>& selection, Point origin) {
     constexpr Pixel white = 0xffffffff, black = 0xff000000;
     Plane mask(white);
     if (!selection) return mask;
     auto dark = std::make_shared<Tile>();
     dark->px.fill(black);
     eachTile(canvas, [&](Coord coord, Rect area) {
-        const auto reveal = intersect(area, *selection);
-        if (reveal == area) return;
+        const auto global = Rect{area.x + origin.x, area.y + origin.y, area.w, area.h};
+        const auto reveal = intersect(global, selection->bounds());
+        if (selection->rectangular() && reveal == global) return;
         if (reveal.empty() && area.w == tileEdge && area.h == tileEdge) {
             mask.assign(coord, dark);
             return;
         }
-        auto& tile = mask.edit(coord);
-        for (int y = area.y; y < area.bottom(); ++y) for (int x = area.x; x < area.right(); ++x) {
-            if (!reveal.contains({x, y})) tile.px[(y - coord.y * tileEdge) * tileEdge + x - coord.x * tileEdge] = black;
+        Tile tile;
+        tile.px.fill(white);
+        int revealed = 0;
+        for (int y = area.y; y < area.bottom(); ++y) {
+            auto* row = tile.px.data() + (y - coord.y * tileEdge) * tileEdge + area.x - coord.x * tileEdge;
+            std::fill_n(row, area.w, black);
+            Run scratch;
+            for (const auto span : selection->row(y + origin.y, scratch)) {
+                const int first = std::max(global.x, span.first), last = std::min(global.right(), span.last);
+                if (first < last) {
+                    std::fill(row + first - global.x, row + last - global.x, white);
+                    revealed += last - first;
+                }
+            }
         }
+        if (revealed == area.w * area.h) return;
+        if (!revealed && area.w == tileEdge && area.h == tileEdge) mask.assign(coord, dark);
+        else mask.assign(coord, std::make_shared<Tile>(std::move(tile)));
     });
     return mask;
 }
@@ -412,13 +604,16 @@ Document::Document(State state, std::wstring label, std::size_t limit)
     : state_(std::move(state)), historyLimit_(limit) {
     if (state_.layers.empty()) state_.layers.emplace_back();
     state_.active = std::clamp(state_.active, 0, int(state_.layers.size()) - 1);
-    history_.push_back({state_, std::move(label), 0, 0});
+    history_.push_back({state_, {}, std::move(label), 0, 0, 0});
 }
 void Document::select(int index) {
     if (index >= 0 && index < int(state_.layers.size())) state_.active = index;
 }
 void Document::begin() {
-    if (!baseline_) baseline_ = state_;
+    if (!baseline_) {
+        baseline_ = state_;
+        baselineSelection_ = selection;
+    }
 }
 bool Document::commit(std::wstring label) {
     if (!baseline_) return false;
@@ -426,12 +621,16 @@ bool Document::commit(std::wstring label) {
         layer.pixels.prune();
         if (layer.mask) layer.mask->prune();
     }
-    if (same(*baseline_, state_)) {
+    const bool changed = !same(*baseline_, state_);
+    const bool selectionChanged = selection != baselineSelection_;
+    if (!changed && !selectionChanged) {
         baseline_.reset();
+        baselineSelection_.reset();
         return false;
     }
-    const auto cost = estimate(*baseline_, state_);
-    Entry entry{state_, std::move(label), nextId_, cost};
+    std::size_t cost = changed ? estimate(*baseline_, state_) : sizeof(Entry) + state_.layers.size() * sizeof(Layer);
+    if (selectionChanged) cost += (selection ? selection->memoryBytes() : 0) + (baselineSelection_ ? baselineSelection_->memoryBytes() : 0);
+    Entry entry{state_, selection, std::move(label), nextId_, changed ? nextId_ : contentId(), cost};
     history_.reserve(index_ + 2);
     while (history_.size() > index_ + 1) {
         historyBytes_ -= history_.back().cost;
@@ -440,6 +639,7 @@ bool Document::commit(std::wstring label) {
     history_.push_back(std::move(entry));
     ++nextId_;
     baseline_.reset();
+    baselineSelection_.reset();
     historyBytes_ += cost;
     while (history_.size() > 1 && (historyBytes_ > historyLimit_ || history_.size() > 80)) {
         historyBytes_ -= history_[1].cost;
@@ -450,15 +650,18 @@ bool Document::commit(std::wstring label) {
     return true;
 }
 void Document::cancel() {
-    if (baseline_) state_ = std::move(*baseline_);
+    if (baseline_) {
+        state_ = std::move(*baseline_);
+        selection = std::move(baselineSelection_);
+    }
     baseline_.reset();
+    baselineSelection_.reset();
 }
 bool Document::jump(std::size_t position) {
     if (baseline_ || position >= history_.size() || position == index_) return false;
-    const auto before = state_.bounds();
     state_ = State(history_[position].state);
+    selection = history_[position].selection;
     index_ = position;
-    if (before.w != state_.width || before.h != state_.height) selection.reset();
     return true;
 }
 bool Document::undo() { return index_ > 0 && jump(index_ - 1); }
@@ -472,7 +675,7 @@ std::size_t Document::pixelBytes() const {
     return used.size() * sizeof(Tile);
 }
 
-Rect stamp(Layer& layer, Rect clip, float x, float y, const Brush& brush, const CloneSample* clone) {
+Rect stamp(Layer& layer, Rect clip, float x, float y, const Brush& brush, const CloneSample* clone, const Selection* selection) {
     const float radius = brush.diameter * 0.5f;
     Rect region{int(std::floor(x - radius)), int(std::floor(y - radius)),
         int(std::ceil(x + radius) - std::floor(x - radius)), int(std::ceil(y + radius) - std::floor(y - radius))};
@@ -505,16 +708,16 @@ Rect stamp(Layer& layer, Rect clip, float x, float y, const Brush& brush, const 
                 source.pixels.pixel(gx + clone->offset.x - source.x, gy + clone->offset.y - source.y);
         }
         return paint(old, color, int(coverage * opacity + 0.5f), brush.erase, brush.mask);
-    });
+    }, selection, {layer.x, layer.y});
     return region;
 }
-void fill(Layer& layer, Rect area, Pixel color, bool erase, bool mask) {
+void fill(Layer& layer, Rect area, Pixel color, bool erase, bool mask, const Selection* selection) {
     auto& plane = mask ? *layer.mask : layer.pixels;
     modify(plane, local(layer, area), erase && !mask, [&](Pixel old, int, int) {
         return paint(old, color, 255, erase, mask);
-    });
+    }, selection, {layer.x, layer.y});
 }
-void gradient(Layer& layer, Rect area, Point from, Point to, Pixel start, Pixel end, bool mask) {
+void gradient(Layer& layer, Rect area, Point from, Point to, Pixel start, Pixel end, bool mask, const Selection* selection) {
     const double dx = to.x - from.x, dy = to.y - from.y;
     const double length = std::max(1.0, dx * dx + dy * dy);
     auto& plane = mask ? *layer.mask : layer.pixels;
@@ -523,19 +726,19 @@ void gradient(Layer& layer, Rect area, Point from, Point to, Pixel start, Pixel 
         auto mix = [t](int a, int b) { return int(a + (b - a) * t + 0.5); };
         return paint(old, rgba(mix(red(start), red(end)), mix(green(start), green(end)),
             mix(blue(start), blue(end)), mix(alpha(start), alpha(end))), 255, false, mask);
-    });
+    }, selection, {layer.x, layer.y});
 }
-void ellipse(Layer& layer, Rect area, Rect clip, Pixel color) {
+void ellipse(Layer& layer, Rect area, Rect clip, Pixel color, const Selection* selection) {
     const double rx = area.w / 2.0, ry = area.h / 2.0;
     modify(layer.pixels, local(layer, intersect(area, clip)), false, [&](Pixel old, int x, int y) {
         const double dx = (x + layer.x + 0.5 - area.x - rx) / rx;
         const double dy = (y + layer.y + 0.5 - area.y - ry) / ry;
         const double edge = (1.0 - std::sqrt(dx * dx + dy * dy)) * std::min(rx, ry) + 0.5;
         return paint(old, color, int(std::clamp(edge, 0.0, 1.0) * 255), false, false);
-    });
+    }, selection, {layer.x, layer.y});
 }
-Rect flood(Layer& layer, Rect clip, Point point, Pixel color, int tolerance, bool mask) {
-    if (!clip.contains(point)) return {};
+Rect flood(Layer& layer, Rect clip, Point point, Pixel color, int tolerance, bool mask, const Selection* selection) {
+    if (!clip.contains(point) || (selection && !selection->contains(point))) return {};
     auto& plane = mask ? *layer.mask : layer.pixels;
     clip = local(layer, clip);
     point = {point.x - layer.x, point.y - layer.y};
@@ -553,7 +756,7 @@ Rect flood(Layer& layer, Rect clip, Point point, Pixel color, int tolerance, boo
         return wasSet;
     };
     auto matches = [&](int x, int y) {
-        if (seen(x, y, false)) return false;
+        if (seen(x, y, false) || (selection && !selection->contains({x + layer.x, y + layer.y}))) return false;
         const auto c = plane.pixel(x, y);
         return std::max({std::abs(red(c) - red(target)), std::abs(green(c) - green(target)),
             std::abs(blue(c) - blue(target)), std::abs(alpha(c) - alpha(target))}) <= tolerance;
@@ -582,7 +785,7 @@ Rect flood(Layer& layer, Rect clip, Point point, Pixel color, int tolerance, boo
     }
     return changed;
 }
-void adjust(Layer& layer, Rect area, Filter filter, int amount) {
+void adjust(Layer& layer, Rect area, Filter filter, int amount, const Selection* selection) {
     modify(layer.pixels, local(layer, area), true, [&](Pixel c, int, int) {
         if (!alpha(c)) return c;
         auto channel = [&](int v) {
@@ -592,9 +795,9 @@ void adjust(Layer& layer, Rect area, Filter filter, int amount) {
             return std::clamp(128 + (v - 128) * (100 + amount) / 100, 0, 255);
         };
         return rgba(channel(red(c)), channel(green(c)), channel(blue(c)), alpha(c));
-    });
+    }, selection, {layer.x, layer.y});
 }
-void boxBlur(Layer& layer, Rect area, int radius) {
+void boxBlur(Layer& layer, Rect area, int radius, const Selection* selection) {
     if (radius <= 0) return;
     const Plane source = layer.pixels;
     const auto extent = source.extent();
@@ -635,8 +838,36 @@ void boxBlur(Layer& layer, Rect area, int radius) {
                 sum.add(horizontal[(y + diameter) * patch.w + x], 1);
             }
         }
-        importPixels(layer.pixels, patch, result, patch.w);
+        modify(layer.pixels, patch, false, [&](Pixel, int x, int y) {
+            return result[std::size_t(y - patch.y) * patch.w + x - patch.x];
+        }, selection, {layer.x, layer.y});
     });
+}
+Layer layerViaSelection(const Layer& source, const Selection& selection) {
+    Layer copy = source;
+    copy.pixels = Plane();
+    copy.locked = false;
+    const auto area = intersect(local(source, selection.bounds()), source.pixels.extent());
+    eachTile(area, [&](Coord coord, Rect clip) {
+        const auto tile = source.pixels.tiles().find(coord);
+        if (tile == source.pixels.tiles().end()) return;
+        bool covered = clip.w == tileEdge && clip.h == tileEdge;
+        for (int y = clip.y; covered && y < clip.bottom(); ++y) {
+            Run scratch;
+            const auto runs = selection.row(y + source.y, scratch);
+            const auto run = std::lower_bound(runs.begin(), runs.end(), clip.x + source.x,
+                [](Run r, int x) { return r.last <= x; });
+            covered = run != runs.end() && run->first <= clip.x + source.x && run->last >= clip.right() + source.x;
+        }
+        if (covered) {
+            copy.pixels.assign(coord, tile->second);
+        } else {
+            modify(copy.pixels, clip, false, [&](Pixel, int x, int y) {
+                return tile->second->px[(y - coord.y * tileEdge) * tileEdge + x - coord.x * tileEdge];
+            }, &selection, {source.x, source.y});
+        }
+    });
+    return copy;
 }
 void crop(State& state, Rect area) {
     area = intersect(area, state.bounds());
@@ -645,10 +876,22 @@ void crop(State& state, Rect area) {
         layer.x -= area.x;
         layer.y -= area.y;
     }
+    for (auto& guide : state.guides) guide.position -= guide.vertical ? area.x : area.y;
+    std::erase_if(state.guides, [&](Guide guide) { return guide.position < 0 || guide.position > (guide.vertical ? area.w : area.h); });
     state.width = area.w;
     state.height = area.h;
 }
+void resizeCanvas(State& state, int width, int height) {
+    const int x = (width - state.width) / 2, y = (height - state.height) / 2;
+    for (auto& layer : state.layers) { layer.x += x; layer.y += y; }
+    for (auto& guide : state.guides) guide.position += guide.vertical ? x : y;
+    std::erase_if(state.guides, [&](Guide guide) { return guide.position < 0 || guide.position > (guide.vertical ? width : height); });
+    state.width = width;
+    state.height = height;
+}
 void flip(State& state, bool horizontal) {
+    for (auto& guide : state.guides) if (guide.vertical == horizontal)
+        guide.position = (horizontal ? state.width : state.height) - guide.position;
     for (auto& layer : state.layers) {
         auto mirror = [&](const Plane& source) {
             Plane result(source.background());
@@ -674,6 +917,10 @@ void flip(State& state, bool horizontal) {
     }
 }
 void rotateClockwise(State& state) {
+    for (auto& guide : state.guides) {
+        if (!guide.vertical) guide.position = state.height - guide.position;
+        guide.vertical = !guide.vertical;
+    }
     for (auto& layer : state.layers) {
         auto rotate = [](const Plane& source) {
             Plane result(source.background());
@@ -730,6 +977,7 @@ State resize(const State& source, int width, int height) {
     out.width = width;
     out.height = height;
     const double sx = double(source.width) / width, sy = double(source.height) / height;
+    for (auto& guide : out.guides) guide.position = int(std::round(guide.position / (guide.vertical ? sx : sy)));
     for (auto& layer : out.layers) {
         const int ox = layer.x, oy = layer.y;
         layer.x = 0;
@@ -788,6 +1036,22 @@ void mergeVisible(State& state, bool flatten) {
     state.layers.push_back(std::move(merged));
     state.active = int(state.layers.size()) - 1;
 }
+bool mergeDown(State& state) {
+    if (state.active <= 0) return false;
+    const auto& lower = state.layers[state.active - 1];
+    const auto& upper = state.layers[state.active];
+    if (!lower.visible || !upper.visible || lower.adjustment || upper.adjustment ||
+        lower.blend != Blend::normal || upper.blend != Blend::normal) return false;
+    State pair{state.width, state.height, {lower, upper}, 1, state.ppi};
+    mergeVisible(pair, false);
+    auto layer = std::move(pair.layers.front());
+    layer.name = lower.name;
+    layer.locked = lower.locked;
+    state.layers[state.active - 1] = std::move(layer);
+    state.layers.erase(state.layers.begin() + state.active);
+    --state.active;
+    return true;
+}
 
 void importPixels(Plane& plane, Rect area, std::span<const Pixel> pixels, int stride) {
     modify(plane, area, false, [&](Pixel, int x, int y) {
@@ -799,16 +1063,18 @@ void composite(const State& state, Rect area, std::span<Pixel> pixels, int strid
     for (int y = 0; y < area.h; ++y) std::fill_n(pixels.data() + std::size_t(y) * stride, area.w, 0);
     for (const auto& layer : state.layers) {
         if (!layer.visible || !layer.opacity) continue;
+        const Plane* maskPlane = layer.mask && layer.maskEnabled ? &*layer.mask : nullptr;
+        const int defaultOpacity = mul255(layer.opacity, maskPlane ? red(maskPlane->background()) : 255);
         const Rect rel = local(layer, area);
         if (layer.adjustment) {
             const AdjustmentMap mapping(*layer.adjustment);
             eachTile(rel, [&](Coord coord, Rect clip) {
-                const Tile* mask = layer.mask ? layer.mask->tile(coord) : nullptr;
+                const Tile* mask = maskPlane ? maskPlane->tile(coord) : nullptr;
                 for (int y = clip.y; y < clip.bottom(); ++y) {
                     const int offset = (y - coord.y * tileEdge) * tileEdge + clip.x - coord.x * tileEdge;
                     auto* out = pixels.data() + std::size_t(y - rel.y) * stride + clip.x - rel.x;
                     for (int x = 0; x < clip.w; ++x) {
-                        const int opacity = mask ? mul255(layer.opacity, red(mask->px[offset + x])) : layer.opacity;
+                        const int opacity = mask ? mul255(layer.opacity, red(mask->px[offset + x])) : defaultOpacity;
                         out[x] = mapping.apply(out[x], opacity, layer.blend);
                     }
                 }
@@ -816,19 +1082,20 @@ void composite(const State& state, Rect area, std::span<Pixel> pixels, int strid
             continue;
         }
         if (layer.pixels.tiles().empty()) continue;
+        layerEffects(layer, area, 1, area.w, area.h, pixels, stride);
         eachTile(rel, [&](Coord coord, Rect clip) {
             auto tile = layer.pixels.tile(coord);
             if (!tile) return;
-            const Tile* mask = layer.mask ? layer.mask->tile(coord) : nullptr;
+            const Tile* mask = maskPlane ? maskPlane->tile(coord) : nullptr;
             for (int y = clip.y; y < clip.bottom(); ++y) {
                 const int offset = (y - coord.y * tileEdge) * tileEdge + clip.x - coord.x * tileEdge;
                 auto out = pixels.data() + std::size_t(y - rel.y) * stride + clip.x - rel.x;
                 const auto src = tile->px.data() + offset;
                 if (mask) {
                     for (int x = 0; x < clip.w; ++x)
-                        out[x] = over(out[x], src[x], mul255(layer.opacity, red(mask->px[offset + x])), layer.blend);
+                        out[x] = over(out[x], styledPixel(src[x], layer), mul255(layer.opacity, red(mask->px[offset + x])), layer.blend);
                 } else {
-                    for (int x = 0; x < clip.w; ++x) out[x] = over(out[x], src[x], layer.opacity, layer.blend);
+                    for (int x = 0; x < clip.w; ++x) out[x] = over(out[x], styledPixel(src[x], layer), defaultOpacity, layer.blend);
                 }
             }
         });
@@ -843,8 +1110,11 @@ void preview(const State& state, Rect area, int step, int width, int height, std
     std::fill(pixels.begin(), pixels.end(), 0);
     for (const auto& layer : state.layers) {
         if (!layer.visible || !layer.opacity || (!layer.adjustment && layer.pixels.tiles().empty())) continue;
+        const Plane* maskPlane = layer.mask && layer.maskEnabled ? &*layer.mask : nullptr;
+        const int defaultOpacity = mul255(layer.opacity, maskPlane ? red(maskPlane->background()) : 255);
         if (transform && &layer == &state.layers[state.active]) {
             const InverseTransform inverse(*transform);
+            layerEffects(layer, area, step, width, height, pixels, width, &inverse);
             if (intersect(area, inverse.extent()).empty()) continue;
             for (int y = 0; y < height; ++y) for (int x = 0; x < width; ++x) {
                 const int gx = std::min(area.right() - 1, area.x + x * step + step / 2);
@@ -853,13 +1123,14 @@ void preview(const State& state, Rect area, int step, int width, int height, std
                 if (!inverse.map(gx, gy, px, py)) continue;
                 const int lx = int(std::round(px)) - layer.x, ly = int(std::round(py)) - layer.y;
                 auto& out = pixels[std::size_t(y) * width + x];
-                const int opacity = layer.mask ? mul255(layer.opacity, red(layer.mask->pixel(lx, ly))) : layer.opacity;
-                out = over(out, layer.pixels.pixel(lx, ly), opacity, layer.blend);
+                const int opacity = maskPlane ? mul255(layer.opacity, red(maskPlane->pixel(lx, ly))) : layer.opacity;
+                out = over(out, styledPixel(layer.pixels.pixel(lx, ly), layer), opacity, layer.blend);
             }
             continue;
         }
         std::optional<AdjustmentMap> mapping;
         if (layer.adjustment) mapping.emplace(*layer.adjustment);
+        else layerEffects(layer, area, step, width, height, pixels, width);
         for (int y = 0; y < height; ++y) {
             const int iy = std::min(area.bottom() - 1, area.y + y * step + step / 2) - layer.y;
             const int ty = tileIndex(iy);
@@ -872,13 +1143,14 @@ void preview(const State& state, Rect area, int step, int width, int height, std
                 if (tx != previous) {
                     previous = tx;
                     tile = layer.pixels.tile({tx, ty});
-                    mask = layer.mask ? layer.mask->tile({tx, ty}) : nullptr;
+                    mask = maskPlane ? maskPlane->tile({tx, ty}) : nullptr;
                 }
                 if (!tile && !mapping) continue;
                 const int i = (iy - ty * tileEdge) * tileEdge + ix - tx * tileEdge;
                 auto& out = pixels[std::size_t(y) * width + x];
-                const int opacity = mask ? mul255(layer.opacity, red(mask->px[i])) : layer.opacity;
-                out = mapping ? mapping->apply(out, opacity, layer.blend) : over(out, tile->px[i], opacity, layer.blend);
+                const int opacity = mask ? mul255(layer.opacity, red(mask->px[i])) : defaultOpacity;
+                out = mapping ? mapping->apply(out, opacity, layer.blend) :
+                    over(out, styledPixel(tile->px[i], layer), opacity, layer.blend);
             }
         }
     }

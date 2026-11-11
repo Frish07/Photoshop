@@ -122,6 +122,81 @@ void editingTests() {
         sample(tinted, 32, 20) == sample(retained, 32, 20), "Merge Visible changed the appearance");
 }
 
+void selectionTests() {
+    const auto region = ellipseSelection({111, 104, 40, 48}, {0, 0, 256, 256});
+    expect(region.contains({128, 128}) && !region.contains({111, 104}) && region.outline().size() > 4,
+        "Elliptical selection or its outline is incorrect");
+    const auto cutout = combineSelection(region, Selection({127, 100, 2, 60}), SelectMode::subtract);
+    expect(cutout.contains({125, 128}) && !cutout.contains({128, 128}) && cutout.contains({132, 128}),
+        "Subtracting a selection lost the wrong pixels");
+    const std::array path{Point{7, 8}, Point{31, 8}, Point{7, 32}};
+    const auto triangle = lassoSelection(path, {0, 0, 256, 256});
+    expect(triangle.contains({9, 9}) && !triangle.contains({27, 27}), "Polygonal lasso did not close");
+    const auto united = combineSelection(region, triangle, SelectMode::add);
+    const auto intersection = combineSelection(united, triangle, SelectMode::intersect);
+    expect(intersection.bounds() == triangle.bounds() && !intersection.contains({128, 128}),
+        "Intersecting disjoint selections used the wrong spans");
+
+    const auto red = rgba(250, 50, 20);
+    Layer offset;
+    offset.x = 9;
+    offset.y = -5;
+    fill(offset, {101, 99, 70, 70}, red, false, false, &region);
+    const auto selected = layerViaSelection(offset, cutout);
+    expect(selected.pixels.pixel(125 - offset.x, 128 - offset.y) == red &&
+        selected.pixels.pixel(128 - offset.x, 128 - offset.y) == 0 &&
+        offset.pixels.pixel(111 - offset.x, 104 - offset.y) == 0, "Pixel edits or Layer via Copy ignored the selection");
+    const auto alphaRegion = selectLayerPixels(selected, {0, 0, 256, 256});
+    expect(alphaRegion.contains({125, 128}) && !alphaRegion.contains({128, 128}), "Ctrl-click transparency selected empty pixels");
+
+    State painted{64, 32, {Layer{}}};
+    fill(painted.layers[0], {2, 2, 16, 13}, red);
+    fill(painted.layers[0], {40, 16, 10, 8}, rgba(245, 52, 21));
+    const auto connected = wandSelection(painted, {8, 7}, 8, true, true);
+    const auto all = wandSelection(painted, {8, 7}, 8, false, false);
+    expect(connected.bounds() == Rect{2, 2, 16, 13} && !connected.contains({45, 20}) &&
+        all.contains({45, 20}) && !all.contains({27, 12}), "Magic Wand tolerance or contiguous mode is incorrect");
+
+    Document history(painted);
+    history.begin(); history.selection = all; history.commit(L"Wand");
+    expect(!history.dirty() && history.undo() && !history.selection && history.redo() &&
+        history.selection && history.selection->contains({45, 20}), "Selection history changed the save state or failed to restore the selection");
+}
+
+void stylesTests() {
+    State styled{80, 64, {Layer{}}};
+    auto& layer = styled.layers[0];
+    fill(layer, {10, 10, 5, 5}, rgba(220, 170, 140));
+    layer.fillOpacity = 0;
+    layer.style = {rgba(0, 255, 0), rgba(0, 0, 255), rgba(0, 0, 0, 200), 2, 0, 5, 180};
+    expect(sample(styled, 12, 12) == rgba(0, 255, 0), "Fill opacity hid the Color Overlay");
+    expect(sample(styled, 15, 12) == rgba(0, 0, 255) && sample(styled, 18, 12) == rgba(0, 0, 0, 200),
+        "Stroke and Drop Shadow did not render outside the layer");
+    layer.style.shadowRadius = 3;
+    std::vector<Pixel> frame(std::size_t(styled.width) * styled.height);
+    composite(styled, styled.bounds(), frame, styled.width);
+    expect(frame[12 * styled.width + 19] == sample(styled, 19, 12), "Shadow blur changed at tile boundaries");
+    layer.mask.emplace(rgba(0, 0, 0));
+    expect(sample(styled, 12, 12) == 0 && sample(styled, 18, 12) == 0, "A black mask failed to hide layer styles");
+    layer.maskEnabled = false;
+    expect(sample(styled, 12, 12) == rgba(0, 255, 0), "Disabling the layer mask did not restore its style");
+    expect(over(rgba(210, 80, 90), rgba(80, 100, 30), 255, Blend::linearDodge) == rgba(255, 180, 120) &&
+        over(rgba(100, 100, 100), rgba(255, 0, 0), 255, Blend::color) == rgba(255, 34, 34),
+        "Layer blend math is incorrect");
+
+    styled.guides = {{true, 15}, {false, 20}};
+    rotateClockwise(styled);
+    expect(styled.guides == std::vector<Guide>{{false, 15}, {true, 44}}, "Canvas rotation misplaced guides");
+    const auto resized = resize(styled, 128, 160);
+    expect(resized.guides == std::vector<Guide>{{false, 30}, {true, 88}}, "Canvas scaling misplaced guides");
+    State merge{32, 32, {Layer{}, Layer{}}, 1};
+    fill(merge.layers[0], {4, 3, 5, 5}, rgba(20, 40, 80));
+    fill(merge.layers[1], {8, 6, 8, 8}, rgba(25, 150, 220, 190));
+    const auto before = sample(merge, 8, 7);
+    expect(mergeDown(merge) && merge.layers.size() == 1 && sample(merge, 8, 7) == before,
+        "Merge Down changed the rendered pixels");
+}
+
 struct Sandbox {
     std::filesystem::path root = std::filesystem::current_path() /
         (L"pixelforge-tests-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()));
@@ -138,12 +213,14 @@ struct Sandbox {
 void formatTests() {
     Sandbox temp;
     State state{153, 89, {Layer{}, Layer{}}, 1, 144};
+    state.guides = {{true, 23}, {false, 78}};
     state.layers[0].name = L"Небо";
     state.layers[0].locked = true;
     fill(state.layers[0], {3, 8, 145, 75}, rgba(240, 128, 88));
     auto& layer = state.layers[1];
     layer.name = L"Маска α";
     layer.x = -9; layer.y = 12; layer.opacity = 216; layer.blend = Blend::screen;
+    layer.fillOpacity = 192;
     layer.mask.emplace(0xffffffff);
     fill(layer, {22, 18, 56, 41}, rgba(44, 117, 216, 194));
     fill(layer, {31, 20, 15, 16}, rgba(84, 84, 84), false, true);
@@ -155,7 +232,8 @@ void formatTests() {
         loaded.layers[1].name == layer.name && loaded.layers[1].mask && loaded.layers[1].x == -9 &&
         loaded.layers[1].blend == Blend::screen, "Project did not preserve editable state");
     expect(sample(state, 35, 25) == sample(loaded, 35, 25), "Project changed pixel values");
-    expect(loaded.ppi == 144, "Project did not preserve resolution");
+    expect(loaded.ppi == 144 && loaded.guides == state.guides && loaded.layers[1].fillOpacity == layer.fillOpacity,
+        "Project did not preserve resolution, guides or Fill opacity");
     auto duplicated = state;
     duplicated.layers.push_back(duplicated.layers[0]);
     save(duplicated, pxf);
@@ -165,13 +243,14 @@ void formatTests() {
     const auto psd = temp.file(L"layers.psd");
     exportImage(state, psd);
     const auto psdDoc = open(psd);
-    expect(psdDoc.layers.size() == 2 && psdDoc.layers[1].name == layer.name && psdDoc.layers[1].opacity == 216,
+    expect(psdDoc.layers.size() == 2 && psdDoc.layers[1].name == layer.name && psdDoc.layers[1].opacity == 216 &&
+        psdDoc.layers[1].mask && psdDoc.layers[1].fillOpacity == layer.fillOpacity,
         "PSD did not preserve layers");
     expect(sample(state, 50, 30) == sample(psdDoc, 50, 30), "PSD opaque blend did not round trip");
-    expect(psdDoc.ppi == 144, "PSD did not preserve resolution");
+    expect(psdDoc.ppi == 144 && psdDoc.guides == state.guides, "PSD did not preserve resolution and guides");
     const auto original = sample(state, 35, 25), restored = sample(psdDoc, 35, 25);
     expect(std::abs(red(original) - red(restored)) <= 2 && std::abs(blue(original) - blue(restored)) <= 2,
-        "PSD export did not apply the layer mask");
+        "PSD export did not preserve the layer mask");
 
     for (const auto name : {L"image.png", L"image.jpg", L"image.bmp", L"image.tif"}) {
         const auto path = temp.file(name);
@@ -200,6 +279,21 @@ void formatTests() {
     const auto baked = open(psd);
     expect(baked.layers.size() == 1 && sample(baked, 12, 18) == sample(state, 12, 18),
         "PSD export did not render adjustment layers");
+
+    State layerStyle{40, 32, {Layer{}}};
+    auto& fx = layerStyle.layers.front();
+    fill(fx, {2, 2, 8, 8}, rgba(205, 60, 55));
+    fx.blend = Blend::softLight;
+    fx.style.shadow = rgba(10, 20, 30, 190);
+    fx.style.shadowRadius = 2;
+    fx.style.shadowAngle = -90;
+    fx.mask.emplace(rgba(0, 0, 0));
+    fx.maskEnabled = false;
+    save(layerStyle, pxf);
+    const auto styled = open(pxf);
+    expect(styled.layers[0].style == fx.style && styled.layers[0].blend == fx.blend &&
+        !styled.layers[0].maskEnabled && styled.layers[0].mask->background() == rgba(0, 0, 0) &&
+        sample(styled, 4, 4) == sample(layerStyle, 4, 4), "Project lost a layer style or mask setting");
 
     const auto old = temp.file(L"legacy.pxf");
     {
@@ -267,6 +361,8 @@ int main(int argc, char** argv) {
     try {
         documentTests();
         editingTests();
+        selectionTests();
+        stylesTests();
         formatTests();
         std::cout << "PixelForge core tests passed.\n";
         if (argc == 2 && std::string_view(argv[1]) == "--benchmark") benchmark();

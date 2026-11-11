@@ -10,10 +10,9 @@ namespace {
 constexpr unsigned ink = 0xededed, muted = 0xbcbcbc, faint = 0x929292, border = 0x1c1c1c;
 constexpr unsigned menuBg = 0x292929, panelBg = 0x323232, sub = 0x363636, fieldBg = 0x252525;
 constexpr unsigned selected = 0x444c58, blueAccent = 0x79adff, actionBlue = 0x276cde;
-constexpr float toolbarWidth = 52, ruler = 20, tabsTop = 70, tabsBottom = 104, bottomBar = 28;
+constexpr float toolbarWidth = 45, ruler = 20, tabsTop = 70, tabsBottom = 104, bottomBar = 28;
 constexpr const wchar_t* labels[]{L"File", L"Edit", L"Image", L"Layer", L"Select", L"Filter", L"View", L"Window", L"Help"};
 constexpr float labelWidths[]{37, 39, 54, 49, 51, 46, 45, 66, 46};
-constexpr const wchar_t* modes[]{L"Normal", L"Multiply", L"Screen", L"Overlay", L"Darken", L"Lighten", L"Difference"};
 constexpr DWRITE_TEXT_ALIGNMENT center = DWRITE_TEXT_ALIGNMENT_CENTER;
 constexpr DWRITE_TEXT_ALIGNMENT right = DWRITE_TEXT_ALIGNMENT_TRAILING;
 
@@ -75,11 +74,12 @@ bool App::createTarget() {
 void App::layout() {
     const auto size = target_->GetSize();
     w_ = size.width; h_ = size.height;
-    const float sidebarWidth = showPanels_ && tab() ? std::clamp(w_ * 0.208f, 244.0f, 306.0f) : 0;
-    const float toolsWidth = showPanels_ && tab() ? toolbarWidth : 0;
+    const bool chrome = screenMode_ != 2;
+    const float sidebarWidth = chrome && showPanels_ && showRightPanels_ && tab() ? std::clamp(w_ * 0.208f, 244.0f, 306.0f) : 0;
+    const float toolsWidth = chrome && showPanels_ && tab() ? toolbarWidth : 0;
     sidebar_ = {w_ - sidebarWidth, tabsTop, w_, h_ - bottomBar};
-    viewport_ = {toolsWidth + (showRulers_ ? ruler : 0), tabsBottom + (showRulers_ ? ruler : 0),
-        sidebar_.left, h_ - bottomBar};
+    viewport_ = chrome ? Box{toolsWidth + (showRulers_ ? ruler : 0), tabsBottom + (showRulers_ ? ruler : 0),
+        sidebar_.left, h_ - bottomBar} : box(0, 0, w_, h_);
     if (auto t = tab(); t && t->fit) {
         t->zoom = std::clamp(std::min((width(viewport_) - 90) / t->doc.state().width,
             (height(viewport_) - 94) / t->doc.state().height), 0.0125f, 1.0f);
@@ -89,19 +89,27 @@ void App::layout() {
 void App::paint() {
     if (!createTarget()) return;
     layout();
+    const bool animate = selection() && showExtras_ && !IsIconic(window_);
+    if (animate && !selectionTimer_) selectionTimer_ = SetTimer(window_, 2, 125, nullptr) != 0;
+    else if (!animate && selectionTimer_) { KillTimer(window_, 2); selectionTimer_ = false; }
     ++frame_;
     hits_.clear();
     target_->BeginDraw();
     target_->Clear(color(0x202123));
     try {
-        drawHeader();
+        if (screenMode_ != 2) drawHeader();
         if (tab()) {
             drawCanvas();
-            drawRulers();
-            drawContextBar();
-            if (showPanels_) { drawToolbar(); drawSidebar(); }
+            if (screenMode_ != 2) {
+                drawRulers();
+                drawContextBar();
+                if (showPanels_) {
+                    drawToolbar();
+                    if (showRightPanels_) drawSidebar();
+                }
+            }
         } else drawHome();
-        drawStatus();
+        if (screenMode_ != 2) drawStatus();
         drawTooltip();
     } catch (...) { target_->EndDraw(); throw; }
     if (target_->EndDraw() == D2DERR_RECREATE_TARGET) {
@@ -223,6 +231,16 @@ void App::icon(Icon i, float x, float y, Color c) {
         r(-6, -6, 12, 12);
         for (const int a : {-6, 6}) for (const int b : {-6, 6}) rect(box(x + a - 1.5f, y + b - 1.5f, 3, 3), c);
         break;
+    case Icon::lasso:
+        l(-3, 5, -7, 3); l(-7, 3, -8, -1); l(-8, -1, -5, -5); l(-5, -5, 1, -6); l(1, -6, 7, -3);
+        l(7, -3, 8, 1); l(8, 1, 5, 5); l(5, 5, -1, 5); l(-1, 5, -1, 7); l(-1, 7, 3, 9); break;
+    case Icon::polygonLasso:
+        l(-7, 2, -4, -6); l(-4, -6, 7, -3); l(7, -3, 5, 6); l(5, 6, -7, 2);
+        l(-7, 2, -4, 7); l(-4, 7, 0, 9); break;
+    case Icon::wand:
+        l(-7, 7, 4, -4); l(-4, 8, 7, -3); l(-7, 7, -4, 8); l(4, -4, 7, -3);
+        l(-4, -7, -4, -2); l(-6.5f, -4.5f, -1.5f, -4.5f); l(7, -9, 7, -5); l(5, -7, 9, -7);
+        break;
     }
 }
 
@@ -276,6 +294,27 @@ void App::drawHeader() {
             circle(x + 3, 50, 7, tool_ == Tool::brush ? foreground_ : muted, tool_ == Tool::brush);
             text(box(x + 18, 30, 120, 40), tool_ == Tool::brush ? L"Soft Round" : L"Round Eraser", faint);
         }
+    } else if (selectionTool(tool_)) {
+        const wchar_t* signs[]{L"□", L"+", L"−", L"∩"};
+        const wchar_t* tips[]{L"New Selection", L"Add to Selection (Shift)", L"Subtract from Selection (Alt)", L"Intersect (Shift+Alt)"};
+        for (int i = 0; i < 4; ++i) {
+            button(box(x, 37, 27, 26), signs[i], Hit::selectionMode, i, int(selectionMode_) == i, tips[i]);
+            x += 30;
+        }
+        x += 8;
+        if (tool_ == Tool::wand) {
+            text(box(x, 30, 63, 40), L"Tolerance", muted);
+            x += 63;
+            button(box(x, 37, 42, 26), std::to_wstring(wandTolerance_), Hit::tolerance, 1, false, L"Magic Wand tolerance");
+            x += 49;
+            button(box(x, 37, 80, 26), L"Contiguous", Hit::wandContiguous, 0, wandContiguous_);
+            x += 86;
+            button(box(x, 37, 100, 26), L"Sample All", Hit::wandMerged, 0, wandMerged_);
+        } else {
+            const auto hint = tool_ == Tool::polygonLasso ? L"Click corners · Enter to close" :
+                tool_ == Tool::lasso ? L"Draw a freehand selection" : L"Hold Shift during drag to constrain";
+            text(box(x, 30, 230, 40), hint, muted);
+        }
     } else if (tool_ == Tool::bucket) {
         option(L"Tolerance", std::to_wstring(tolerance_), Hit::tolerance);
         text(box(x, 30, 145, 40), L"Contiguous", muted);
@@ -291,10 +330,11 @@ void App::drawHeader() {
         button(box(x, 37, 32, 26), L"+", Hit::zoomMode, 0, !zoomOutMode_);
         button(box(x + 36, 37, 32, 26), L"−", Hit::zoomMode, 1, zoomOutMode_);
         button(box(x + 76, 37, 66, 26), L"100%", Hit::command, int(Command::actual));
+    } else if (tool_ == Tool::move) {
+        button(box(x, 37, 101, 26), L"Auto-Select", Hit::autoSelect, 0, autoSelect_, L"Pick the layer under the cursor (Ctrl toggles)");
+        button(box(x + 110, 37, 99, 26), L"Free Transform", Hit::command, int(Command::freeTransform));
     } else {
-        const wchar_t* hint = tool_ == Tool::marquee ? L"Drag to select pixels · Shift for square" :
-            tool_ == Tool::move ? L"Drag to move the selected layer" :
-            tool_ == Tool::picker ? L"Sample all visible layers" :
+        const wchar_t* hint = tool_ == Tool::picker ? L"Sample all visible layers" :
             tool_ == Tool::gradient ? L"Linear · Foreground to Background" :
             tool_ == Tool::hand ? L"Drag to pan" : L"Drag to draw · Shift to constrain";
         text(box(x, 30, 290, 40), hint, muted);
@@ -333,17 +373,28 @@ void App::drawToolbar() {
     rect(area, menuBg);
     line(toolbarWidth - 0.5f, tabsTop, toolbarWidth - 0.5f, area.bottom, border);
     float y = tabsTop + 12;
-    for (std::size_t i = 0; i < std::size(tools); ++i) {
-        const auto& t = tools[i];
+    for (std::size_t i = 0; i < std::size(tools);) {
+        const auto first = i;
+        const auto key = tools[i++].key;
+        while (i < std::size(tools) && tools[i].key == key) ++i;
+        const auto prefer = preferredTools_[key - L'A'];
+        const auto chosen = prefer ? std::find_if(tools + first, tools + i, [&](const ToolInfo& tool) { return tool.tool == *prefer; }) :
+            tools + first;
+        const auto& t = chosen == tools + i ? tools[first] : *chosen;
         if (y + 77 > area.bottom) break;
-        if (i == 3 || i == 8 || i == 11) { line(12, y + 2, 39, y + 2, 0x45474c); y += 9; }
-        const auto r = box(8, y, 35, 30);
+        if (key == L'I' || key == L'T' || key == L'H') { line(9, y + 2, 36, y + 2, 0x454545); y += 8; }
+        const auto r = box(6, y, 33, 29);
         const auto label = std::wstring(t.name) + L" (" + t.key + L")";
         iconButton(r, t.icon, Hit::tool, int(t.tool), t.tool == tool_, label);
-        if (t.tool == tool_) rect(box(8, y + 5, 2, 20), blueAccent);
-        y += 31;
+        if (i - first > 1) {
+            line(r.right - 7, r.bottom - 5, r.right - 4, r.bottom - 5, muted);
+            line(r.right - 4, r.bottom - 8, r.right - 4, r.bottom - 5, muted);
+            hit(box(r.right - 9, r.bottom - 10, 9, 10), Hit::moreTools, key, L"More tools in this group");
+        }
+        if (t.tool == tool_) rect(box(6, y + 5, 2, 19), blueAccent);
+        y += 30;
     }
-    iconButton(box(8, y + 2, 35, 25), Icon::more, Hit::moreTools, 0, false, L"All Tools");
+    iconButton(box(6, y + 2, 33, 25), Icon::more, Hit::moreTools, 0, false, L"All Tools");
     y = std::min(y + 44, area.bottom - 43);
     strokeRect(box(23, y + 8, 18, 18), border);
     rect(box(24, y + 9, 16, 16), background_);
@@ -351,8 +402,8 @@ void App::drawToolbar() {
     strokeRect(box(11, y - 2, 22, 22), 0x9a9ba0);
     rect(box(12, y - 1, 20, 20), foreground_);
     hit(box(11, y - 2, 22, 22), Hit::color, 0, L"Foreground color");
-    icon(Icon::swap, 39, y - 4, muted);
-    hit(box(33, y - 13, 14, 15), Hit::swap, 0, L"Swap Colors (X)");
+    icon(Icon::swap, 36, y - 4, muted);
+    hit(box(30, y - 13, 14, 15), Hit::swap, 0, L"Swap Colors (X)");
     rect(box(11, y + 24, 8, 8), 0xeeeeee);
     rect(box(10, y + 22, 7, 7), 0x070809);
     hit(box(7, y + 21, 14, 15), Hit::defaults, 0, L"Default Colors (D)");
@@ -538,7 +589,7 @@ void App::drawLayers(Box area) {
     const float x = area.left + 12, y = area.top + 10;
     const auto blend = box(x, y, width(area) * 0.48f, 26);
     rounded(blend, 4, inside(blend, cursor_) ? 0x45474d : fieldBg);
-    text(box(x + 9, y, width(blend) - 27, 26), modes[std::size_t(layer.blend)], ink);
+    text(box(x + 9, y, width(blend) - 27, 26), blendName(layer.blend), ink);
     icon(Icon::down, blend.right - 12, y + 13, muted);
     hit(blend, Hit::blend, 0, L"Layer blending mode");
     const auto op = box(blend.right + 10, y, area.right - 12 - blend.right - 10, 26);
@@ -546,7 +597,16 @@ void App::drawLayers(Box area) {
     text(box(op.left + 8, y, 52, 26), L"Opacity", muted, 2);
     text(box(op.right - 44, y, 36, 26), std::to_wstring((layer.opacity * 100 + 127) / 255) + L"%", ink, 0, right);
     hit(op, Hit::opacity, 0, L"Change layer opacity");
-    const auto rowTop = area.top + 45;
+    text(box(x + 2, y + 31, 37, 24), L"Lock", muted, 2);
+    iconButton(box(x + 36, y + 31, 24, 24), Icon::lock, Hit::command, int(Command::toggleLock), layer.locked, L"Lock or unlock layer");
+    if (!layer.adjustment) {
+        const auto fill = box(op.left, y + 31, width(op), 24);
+        rounded(fill, 4, inside(fill, cursor_) ? 0x45474d : fieldBg);
+        text(box(fill.left + 8, fill.top, 44, 24), L"Fill", muted, 2);
+        text(box(fill.right - 45, fill.top, 37, 24), std::to_wstring((layer.fillOpacity * 100 + 127) / 255) + L"%", ink, 0, right);
+        hit(fill, Hit::fillOpacity, 0, L"Change fill opacity");
+    }
+    const auto rowTop = area.top + 73;
     const auto footer = area.bottom - 35;
     const int visible = std::max(0, int((footer - rowTop) / 45));
     t->layerScroll = std::clamp(t->layerScroll, 0, std::max(0, int(state.layers.size()) - visible));
@@ -570,15 +630,26 @@ void App::drawLayers(Box area) {
             icon(Icon::adjustment, preview.left + 18, preview.top + 14, ink);
         } else thumb(preview, l, false);
         strokeRect(preview, active && !t->mask ? blueAccent : 0x202124);
+        hit(preview, Hit::layerThumbnail, index, L"Ctrl-click to load layer transparency");
         float tx = preview.right + 10;
         if (l.mask) {
             const auto mask = box(preview.right + 5, preview.top, 27, 29);
             thumb(mask, l, true);
             strokeRect(mask, active && t->mask ? blueAccent : 0x202124);
-            hit(mask, Hit::mask, index, L"Select layer mask");
+            if (!l.maskEnabled) {
+                line(mask.left + 4, mask.top + 4, mask.right - 4, mask.bottom - 4, 0xfa5252, 2);
+                line(mask.right - 4, mask.top + 4, mask.left + 4, mask.bottom - 4, 0xfa5252, 2);
+            }
+            hit(mask, Hit::mask, index, L"Select mask · Shift-click toggles its effect");
             tx = mask.right + 10;
         }
-        text(box(tx, r.top, r.right - tx - 37, 45), l.name, active ? ink : muted, active ? 1 : 0);
+        const bool styled = !l.style.empty();
+        text(box(tx, r.top, r.right - tx - (styled ? 61 : 37), 45), l.name, active ? ink : muted, active ? 1 : 0);
+        if (styled) {
+            const auto fx = box(r.right - 58, r.top + 10, 26, 25);
+            text(fx, L"fx", blueAccent, 1, center);
+            hit(fx, Hit::styles, index, L"Layer effects");
+        }
         if (l.locked || active || inside(r, cursor_)) {
             if (l.locked) iconButton(box(r.right - 31, r.top + 10, 24, 25), Icon::lock, Hit::lock, index, false, L"Unlock layer");
             else if (inside(box(r.right - 31, r.top + 10, 24, 25), cursor_))
@@ -593,12 +664,16 @@ void App::drawLayers(Box area) {
     }
     rect(box(area.left, footer, width(area), 35), menuBg);
     line(area.left, footer + 0.5f, area.right, footer + 0.5f, border);
-    text(box(area.left + 10, footer, 90, 35), std::to_wstring(state.layers.size()) +
+    text(box(area.left + 10, footer, 73, 35), std::to_wstring(state.layers.size()) +
         (state.layers.size() == 1 ? L" layer" : L" layers"), faint, 2);
     const std::array icons{Icon::down, Icon::up, Icon::mask, Icon::plus, Icon::trash};
     const std::array actions{Command::layerDown, Command::layerUp, Command::addMask, Command::addLayer, Command::deleteLayer};
     const wchar_t* tips[]{L"Send Backward", L"Bring Forward", L"Add Layer Mask", L"New Layer (Ctrl+Shift+N)", L"Delete Layer"};
-    for (int i = 0; i < 5; ++i) iconButton(box(area.right - 141 + i * 26, footer + 5, 25, 25), icons[i], Hit::command,
+    const auto fx = box(area.right - 158, footer + 5, 25, 25);
+    if (inside(fx, cursor_)) rounded(fx, 4, 0x444444);
+    text(fx, L"fx", layer.style.empty() ? ink : blueAccent, 1, center);
+    hit(fx, Hit::styles, -1, L"Add a layer style");
+    for (int i = 0; i < 5; ++i) iconButton(box(area.right - 132 + i * 24, footer + 5, 23, 25), icons[i], Hit::command,
         int(actions[i]), false, tips[i]);
 }
 void App::drawHistory(Box area) {
@@ -752,20 +827,9 @@ void App::drawCanvas() {
         const auto p = imageToScreen(float(area.x), float(area.y));
         return box(p.x, p.y, area.w * t->zoom, area.h * t->zoom);
     };
-    const auto selection = drag_ == Drag::marquee ? gesture_ : t->doc.selection;
-    if (selection && !selection->empty()) {
-        const auto r = screen(*selection);
-        strokeRect(r, 0x151618, 1.5f);
-        const auto clipped = overlap(r, viewport_);
-        for (float x = clipped.left; x < clipped.right; x += 8) {
-            line(x, r.top, std::min(x + 4, r.right), r.top, ink);
-            line(x, r.bottom, std::min(x + 4, r.right), r.bottom, ink);
-        }
-        for (float y = clipped.top; y < clipped.bottom; y += 8) {
-            line(r.left, y, r.left, std::min(y + 4, r.bottom), ink);
-            line(r.right, y, r.right, std::min(y + 4, r.bottom), ink);
-        }
-    }
+    drawGuides();
+    drawSelection();
+    drawSelectionGesture();
     const auto crop = drag_ == Drag::crop ? gesture_ : t->cropBox;
     if (crop && !crop->empty()) {
         const auto r = screen(*crop);
@@ -812,6 +876,98 @@ void App::drawCanvas() {
     }
     target_->PopAxisAlignedClip();
 }
+void App::drawSelection() {
+    const auto selected = selection();
+    if (!selected) {
+        selectionDrawn_.reset();
+        selectionPath_.reset();
+        return;
+    }
+    if (!showExtras_ || (gestureMode_ == SelectMode::replace && (drag_ == Drag::marquee || drag_ == Drag::lasso))) return;
+    if (!selectionDrawn_ || *selectionDrawn_ != *selected) {
+        selectionDrawn_ = *selected;
+        if (FAILED(factory_->CreatePathGeometry(selectionPath_.put()))) return;
+        Com<ID2D1GeometrySink> sink;
+        if (FAILED(selectionPath_->Open(sink.put()))) { selectionPath_.reset(); return; }
+        const auto edges = selected->outline();
+        std::unordered_multimap<Coord, std::size_t, CoordHash> adjacent;
+        adjacent.reserve(edges.size() * 2);
+        for (std::size_t i = 0; i < edges.size(); ++i) {
+            adjacent.emplace(Coord{edges[i].from.x, edges[i].from.y}, i);
+            adjacent.emplace(Coord{edges[i].to.x, edges[i].to.y}, i);
+        }
+        std::vector<bool> drawn(edges.size());
+        for (std::size_t i = 0; i < edges.size(); ++i) {
+            if (drawn[i]) continue;
+            const auto start = edges[i].from;
+            auto current = edges[i].to;
+            sink->BeginFigure({float(start.x), float(start.y)}, D2D1_FIGURE_BEGIN_HOLLOW);
+            sink->AddLine({float(current.x), float(current.y)});
+            drawn[i] = true;
+            while (current != start) {
+                const auto [first, last] = adjacent.equal_range({current.x, current.y});
+                const auto next = std::find_if(first, last, [&](const auto& edge) { return !drawn[edge.second]; });
+                if (next == last) break;
+                const auto& edge = edges[next->second];
+                drawn[next->second] = true;
+                current = current == edge.from ? edge.to : edge.from;
+                sink->AddLine({float(current.x), float(current.y)});
+            }
+            sink->EndFigure(current == start ? D2D1_FIGURE_END_CLOSED : D2D1_FIGURE_END_OPEN);
+        }
+        if (FAILED(sink->Close())) { selectionPath_.reset(); return; }
+    }
+    if (!selectionPath_) return;
+    const auto phase = std::size_t((GetTickCount64() / 125) % marchingStyles_.size());
+    auto& style = marchingStyles_[phase];
+    if (!style) {
+        auto properties = D2D1::StrokeStyleProperties();
+        properties.dashStyle = D2D1_DASH_STYLE_CUSTOM;
+        properties.dashOffset = float(phase * 2);
+        const float dashes[]{4, 4};
+        factory_->CreateStrokeStyle(properties, dashes, 2, style.put());
+    }
+    const auto origin = imageToScreen(0, 0);
+    const auto zoom = tab()->zoom;
+    target_->SetTransform(D2D1::Matrix3x2F::Scale(zoom, zoom) * D2D1::Matrix3x2F::Translation(origin.x, origin.y));
+    brush_->SetColor(color(0x111111));
+    target_->DrawGeometry(selectionPath_.get(), brush_.get(), 1.65f / zoom);
+    if (style) {
+        brush_->SetColor(color(0xf7f7f7));
+        target_->DrawGeometry(selectionPath_.get(), brush_.get(), 1.0f / zoom, style.get());
+    }
+    target_->SetTransform(D2D1::Matrix3x2F::Identity());
+}
+void App::drawSelectionGesture() {
+    if (drag_ == Drag::marquee && gesture_) {
+        const auto a = imageToScreen(float(gesture_->x), float(gesture_->y));
+        const auto b = imageToScreen(float(gesture_->right()), float(gesture_->bottom()));
+        const Box area{a.x, a.y, b.x, b.y};
+        if (tool_ == Tool::ellipticalMarquee) {
+            const auto outline = D2D1::Ellipse({(a.x + b.x) / 2, (a.y + b.y) / 2}, width(area) / 2, height(area) / 2);
+            brush_->SetColor(color(0x101010));
+            target_->DrawEllipse(outline, brush_.get(), 2.5f);
+            brush_->SetColor(color(ink));
+            target_->DrawEllipse(outline, brush_.get(), 1);
+        } else {
+            strokeRect(area, 0x101010, 2.5f);
+            strokeRect(area, ink);
+        }
+    }
+    if (lassoPath_.empty()) return;
+    auto toScreen = [&](Point p) { return imageToScreen(float(p.x), float(p.y)); };
+    auto segment = [&](Vec a, Vec b) {
+        line(a.x, a.y, b.x, b.y, 0x111111, 2.4f);
+        line(a.x, a.y, b.x, b.y, ink);
+    };
+    for (std::size_t i = 1; i < lassoPath_.size(); ++i) segment(toScreen(lassoPath_[i - 1]), toScreen(lassoPath_[i]));
+    if (tool_ == Tool::polygonLasso) {
+        if (inside(viewport_, cursor_)) segment(toScreen(lassoPath_.back()), cursor_);
+        const auto first = toScreen(lassoPath_.front());
+        circle(first.x, first.y, 3.5f, 0x101010, true);
+        circle(first.x, first.y, 3, ink);
+    }
+}
 void App::drawTransform() {
     const auto handles = transformHandles();
     for (int i = 0; i < 8; i += 2) {
@@ -836,7 +992,7 @@ void App::drawContextBar() {
     std::array<Action, 3> actions;
     if (t->transform) actions = {{{L"Apply Transform", Command::applyTransform}, {L"Cancel", Command::cancelTransform}, {L"", Command::none}}};
     else if (t->cropBox) actions = {{{L"Apply Crop", Command::cropSelection}, {L"Cancel", Command::deselect}, {L"", Command::none}}};
-    else if (t->doc.selection) actions = {{{L"Deselect", Command::deselect}, {L"Crop", Command::cropSelection}, {L"Copy", Command::copy}}};
+    else if (t->doc.selection) actions = {{{L"Layer via Copy", Command::duplicate}, {L"Inverse", Command::inverseSelection}, {L"Deselect", Command::deselect}}};
     else if (t->doc.active().adjustment) actions = {{{L"Edit Adjustment", Command::editAdjustment}, {L"New Layer", Command::addLayer}, {L"", Command::none}}};
     else if (t->doc.active().locked) actions = {{{L"Unlock Layer", Command::toggleLock}, {L"New Layer", Command::addLayer}, {L"Place Image", Command::place}}};
     else actions = {{{L"New Layer", Command::addLayer}, {L"Place Image", Command::place}, {L"Add Adjustment", Command::addTone}}};
@@ -895,6 +1051,24 @@ void App::drawRulers() {
     }
     line(horizontal.left, horizontal.bottom - 0.5f, horizontal.right, horizontal.bottom - 0.5f, border);
     line(vertical.right - 0.5f, vertical.top, vertical.right - 0.5f, vertical.bottom, border);
+    hit(horizontal, Hit::ruler, 0, L"Drag out a horizontal guide");
+    hit(vertical, Hit::ruler, 1, L"Drag out a vertical guide");
+}
+void App::drawGuides() {
+    if (!showExtras_ || !showGuides_) return;
+    const auto image = imageRect();
+    auto draw = [&](Guide guide, bool dragging) {
+        const auto p = guide.vertical ? imageToScreen(float(guide.position), 0) : imageToScreen(0, float(guide.position));
+        const auto c = dragging ? 0xa3f3ffu : 0x4fd9f3u;
+        if (guide.vertical) line(p.x, image.top, p.x, image.bottom, c, dragging ? 1.5f : 1);
+        else line(image.left, p.y, image.right, p.y, c, dragging ? 1.5f : 1);
+    };
+    const auto& guides = tab()->doc.state().guides;
+    for (std::size_t i = 0; i < guides.size(); ++i) {
+        if (drag_ == Drag::guide && movingGuide_ && int(i) == *movingGuide_) continue;
+        draw(guides[i], false);
+    }
+    if (drag_ == Drag::guide) draw(guideDraft_, true);
 }
 void App::drawHome() {
     constexpr float rail = 202;
