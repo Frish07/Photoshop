@@ -1,0 +1,4 @@
+#include <winuser.h>
+101 RCDATA "coastal-road.jpg"
+102 ICON "pixelforge.ico"
+1 RT_MANIFEST "pixelforge.manifest"
