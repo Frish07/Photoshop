@@ -186,7 +186,7 @@ Pixel Plane::pixel(int x, int y) const {
     return t ? t->px[(y - c.y * tileEdge) * tileEdge + x - c.x * tileEdge] : background_;
 }
 void Plane::detach() {
-    if (!tiles_.unique()) tiles_ = std::make_shared<Tiles>(*tiles_);
+    if (tiles_.use_count() != 1) tiles_ = std::make_shared<Tiles>(*tiles_);
 }
 Tile& Plane::edit(Coord c) {
     detach();
@@ -194,7 +194,7 @@ Tile& Plane::edit(Coord c) {
     if (!t) {
         t = std::make_shared<Tile>();
         if (background_) t->px.fill(background_);
-    } else if (!t.unique()) {
+    } else if (t.use_count() != 1) {
         t = std::make_shared<Tile>(*t);
     }
     return *t;
@@ -205,10 +205,10 @@ void Plane::assign(Coord c, std::shared_ptr<Tile> tile) {
 }
 void Plane::prune() {
     // Shared tiles were untouched by this edit. Newly written tiles can become fully empty.
-    if (!tiles_.unique()) return;
+    if (tiles_.use_count() != 1) return;
     std::erase_if(*tiles_, [&](const auto& pair) {
         const auto& t = pair.second;
-        return t.unique() && std::all_of(t->px.begin(), t->px.end(), [&](Pixel p) { return p == background_; });
+        return t.use_count() == 1 && std::all_of(t->px.begin(), t->px.end(), [&](Pixel p) { return p == background_; });
     });
 }
 Rect Plane::extent() const {
