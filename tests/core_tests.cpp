@@ -78,6 +78,50 @@ void documentTests() {
     expect(over(0xff000000, orange, 255, Blend::multiply) == 0xff000000, "Multiply blend against black failed");
 }
 
+void editingTests() {
+    const auto white = rgba(255, 255, 255), orange = rgba(230, 96, 43);
+    Document large(blankDocument(12000, 8000, 300, white), L"New Document");
+    expect(large.state().layers.size() == 2 && large.state().layers[0].locked && !large.active().locked,
+        "White canvas must be ready for painting above a locked background");
+    expect(sample(large.state(), 11999, 7999) == white && large.pixelBytes() <= 4 * sizeof(Tile),
+        "White background used dense storage or missed the last tile");
+    Document larger(resize(large.state(), 13000, 8100));
+    expect(sample(larger.state(), 12999, 8099) == white && larger.pixelBytes() <= 4 * sizeof(Tile),
+        "Resizing a uniform background used dense storage");
+    Document transparent(blankDocument(1920, 1080, 72, 0));
+    expect(transparent.pixelBytes() == 0 && sample(transparent.state(), 8, 9) == 0, "Transparent preset allocated pixels");
+
+    Document paint({160, 120, {Layer{}, Layer{}}, 1});
+    fill(paint.edit().layers[0], {12, 10, 24, 24}, orange);
+    paint.begin();
+    const CloneSample clone{paint.beforeEdit(), {-45, -30}, true};
+    stamp(paint.active(), paint.state().bounds(), 65.5f, 50.5f, Brush{0, 9, 1, 1}, &clone);
+    expect(paint.commit(L"Clone") && sample(paint.state(), 65, 50) == orange, "Merged clone stamp used the wrong source");
+    expect(sample(paint.historyStart(), 65, 50) == 0, "Initial history was changed by a clone stroke");
+
+    const Rect from{61, 46, 9, 9}, to{76, 69, 18, 18};
+    const TransformView pose{from, to, 90};
+    std::array<Pixel, 1> previewed{};
+    preview(paint.state(), {85, 78, 1, 1}, 1, 1, 1, previewed, &pose);
+    expect(previewed.front() == orange, "Transform preview missed the projected layer");
+    paint.begin();
+    transformLayer(paint.active(), from, to, 90);
+    paint.commit(L"Transform");
+    expect(sample(paint.state(), 85, 78) == orange && sample(paint.state(), 65, 50) == 0,
+        "Committed transform did not match the preview");
+
+    State tinted{80, 64, {Layer{}, Layer{}}, 1, 144};
+    fill(tinted.layers[0], {12, 11, 28, 24}, rgba(255, 0, 0));
+    tinted.layers[1].adjustment = Adjustment{AdjustmentKind::hueSaturation, 120, 0, 0};
+    tinted.layers[1].mask = maskFromSelection(tinted.bounds(), Rect{12, 11, 14, 24});
+    expect(sample(tinted, 18, 20) == rgba(0, 255, 0) && sample(tinted, 32, 20) == rgba(255, 0, 0) &&
+        alpha(sample(tinted, 0, 0)) == 0, "Adjustment changed pixels outside its mask or lost transparency");
+    const auto retained = tinted;
+    mergeVisible(tinted, false);
+    expect(tinted.layers.size() == 1 && sample(tinted, 18, 20) == sample(retained, 18, 20) &&
+        sample(tinted, 32, 20) == sample(retained, 32, 20), "Merge Visible changed the appearance");
+}
+
 struct Sandbox {
     std::filesystem::path root = std::filesystem::current_path() /
         (L"pixelforge-tests-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()));
@@ -93,7 +137,7 @@ struct Sandbox {
 
 void formatTests() {
     Sandbox temp;
-    State state{153, 89, {Layer{}, Layer{}}, 1};
+    State state{153, 89, {Layer{}, Layer{}}, 1, 144};
     state.layers[0].name = L"Небо";
     state.layers[0].locked = true;
     fill(state.layers[0], {3, 8, 145, 75}, rgba(240, 128, 88));
@@ -111,6 +155,7 @@ void formatTests() {
         loaded.layers[1].name == layer.name && loaded.layers[1].mask && loaded.layers[1].x == -9 &&
         loaded.layers[1].blend == Blend::screen, "Project did not preserve editable state");
     expect(sample(state, 35, 25) == sample(loaded, 35, 25), "Project changed pixel values");
+    expect(loaded.ppi == 144, "Project did not preserve resolution");
     auto duplicated = state;
     duplicated.layers.push_back(duplicated.layers[0]);
     save(duplicated, pxf);
@@ -123,6 +168,7 @@ void formatTests() {
     expect(psdDoc.layers.size() == 2 && psdDoc.layers[1].name == layer.name && psdDoc.layers[1].opacity == 216,
         "PSD did not preserve layers");
     expect(sample(state, 50, 30) == sample(psdDoc, 50, 30), "PSD opaque blend did not round trip");
+    expect(psdDoc.ppi == 144, "PSD did not preserve resolution");
     const auto original = sample(state, 35, 25), restored = sample(psdDoc, 35, 25);
     expect(std::abs(red(original) - red(restored)) <= 2 && std::abs(blue(original) - blue(restored)) <= 2,
         "PSD export did not apply the layer mask");
@@ -136,9 +182,33 @@ void formatTests() {
         const auto c = sample(image, 140, 72);
         expect(std::abs(red(c) - 240) <= 4 && std::abs(green(c) - 128) <= 4 && std::abs(blue(c) - 88) <= 4,
             "Raster export changed opaque colors");
-        if (std::filesystem::path(name).extension() == L".png")
+        if (std::filesystem::path(name).extension() == L".png") {
             expect(alpha(sample(image, 0, 0)) == 0, "PNG export did not preserve transparency");
+            expect(std::abs(image.ppi - 144) < 0.1, "PNG did not preserve resolution");
+        }
     }
+
+    Layer correction;
+    correction.adjustment = Adjustment{AdjustmentKind::levels, 10, 230, 180};
+    correction.mask = maskFromSelection(state.bounds(), Rect{3, 7, 32, 40});
+    state.layers.push_back(std::move(correction));
+    save(state, pxf);
+    const auto adjusted = open(pxf);
+    expect(adjusted.layers.back().adjustment == state.layers.back().adjustment &&
+        sample(adjusted, 12, 18) == sample(state, 12, 18), "Editable adjustment did not survive saving");
+    exportImage(state, psd);
+    const auto baked = open(psd);
+    expect(baked.layers.size() == 1 && sample(baked, 12, 18) == sample(state, 12, 18),
+        "PSD export did not render adjustment layers");
+
+    const auto old = temp.file(L"legacy.pxf");
+    {
+        Writer w(old);
+        w.str("PXFORGE2"); w.u32(8); w.u32(6); w.u16(1); w.u16(0);
+        w.u16(3); w.str("Old"); w.u32(0); w.u32(0); w.u8(255); w.u8(0); w.u8(1); w.u32(0);
+        w.close();
+    }
+    expect(open(old).width == 8 && open(old).layers.front().name == L"Old", "Legacy PXF project could not be opened");
 
     const auto rle = temp.file(L"packbits.psd");
     {
@@ -196,6 +266,7 @@ int main(int argc, char** argv) {
     if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) return 1;
     try {
         documentTests();
+        editingTests();
         formatTests();
         std::cout << "PixelForge core tests passed.\n";
         if (argc == 2 && std::string_view(argv[1]) == "--benchmark") benchmark();

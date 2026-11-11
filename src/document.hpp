@@ -21,6 +21,7 @@ inline constexpr int maxLayers = 256;
 struct Point { int x{}, y{}; };
 struct Rect {
     int x{}, y{}, w{}, h{};
+    bool operator==(const Rect&) const = default;
     bool empty() const { return w <= 0 || h <= 0; }
     int right() const { return x + w; }
     int bottom() const { return y + h; }
@@ -43,6 +44,13 @@ Pixel straight(Pixel c);
 
 enum class Blend : std::uint8_t { normal, multiply, screen, overlay, darken, lighten, difference };
 Pixel over(Pixel premulDst, Pixel src, int opacity = 255, Blend mode = Blend::normal);
+enum class AdjustmentKind : std::uint8_t { tone, levels, hueSaturation };
+struct Adjustment {
+    AdjustmentKind kind{};
+    int first{}, second{}, third{};
+    bool operator==(const Adjustment&) const = default;
+};
+bool validAdjustment(const Adjustment& adjustment);
 
 struct Coord {
     int x{}, y{};
@@ -62,6 +70,7 @@ public:
     void assign(Coord c, std::shared_ptr<Tile> tile);
     void prune();
     Rect extent() const;
+    Rect contentBounds() const;
     const Tiles& tiles() const { return *tiles_; }
     const void* identity() const { return tiles_.get(); }
     Pixel background() const { return background_; }
@@ -81,13 +90,17 @@ struct Layer {
     Blend blend = Blend::normal;
     bool visible = true;
     bool locked = false;
+    std::optional<Adjustment> adjustment;
 };
 struct State {
     int width{}, height{};
     std::vector<Layer> layers; // Bottom to top.
     int active{};
+    double ppi = 72;
     Rect bounds() const { return {0, 0, width, height}; }
 };
+State blankDocument(int width, int height, double ppi, Pixel background);
+Plane maskFromSelection(Rect canvas, const std::optional<Rect>& selection);
 
 class Document {
 public:
@@ -107,6 +120,9 @@ public:
     bool inEdit() const { return baseline_.has_value(); }
     std::size_t historyIndex() const { return index_; }
     std::size_t historyCount() const { return history_.size(); }
+    const State& historyStart() const { return history_.front().state; }
+    std::uint64_t historyStartId() const { return history_.front().id; }
+    const State& beforeEdit() const { return baseline_ ? *baseline_ : state_; }
     const std::wstring& historyLabel(std::size_t i) const { return history_[i].label; }
     bool dirty() const { return currentId() != savedId_; }
     void markSaved() { savedId_ = currentId(); }
@@ -134,7 +150,12 @@ struct Brush {
     bool mask = false;
 };
 
-Rect stamp(Layer& layer, Rect clip, float x, float y, const Brush& brush);
+struct CloneSample {
+    const State& source;
+    Point offset;
+    bool merged{};
+};
+Rect stamp(Layer& layer, Rect clip, float x, float y, const Brush& brush, const CloneSample* clone = nullptr);
 void fill(Layer& layer, Rect area, Pixel color, bool erase = false, bool mask = false);
 void gradient(Layer& layer, Rect area, Point from, Point to, Pixel start, Pixel end, bool mask = false);
 void ellipse(Layer& layer, Rect area, Rect clip, Pixel color);
@@ -145,9 +166,13 @@ void boxBlur(Layer& layer, Rect area, int radius);
 void crop(State& state, Rect area);
 void flip(State& state, bool horizontal);
 void rotateClockwise(State& state);
+struct TransformView { Rect original, destination; double degrees; };
+void transformLayer(Layer& layer, Rect original, Rect destination, double degrees);
+void mergeVisible(State& state, bool flatten);
 State resize(const State& source, int width, int height);
 void importPixels(Plane& plane, Rect area, std::span<const Pixel> pixels, int stride);
 void composite(const State& state, Rect area, std::span<Pixel> pixels, int stride);
-void preview(const State& state, Rect area, int step, int width, int height, std::span<Pixel> pixels);
+void preview(const State& state, Rect area, int step, int width, int height, std::span<Pixel> pixels,
+    const TransformView* transform = nullptr);
 
 } // namespace pf

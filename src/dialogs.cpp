@@ -72,6 +72,15 @@ LRESULT CALLBACK dialogProc(HWND window, UINT msg, WPARAM wp, LPARAM lp) {
 }
 } // namespace
 
+int readNumber(const std::wstring& text, int low, int high) {
+    try {
+        std::size_t end{};
+        const int value = std::stoi(text, &end);
+        if (end == text.size() && value >= low && value <= high) return value;
+    } catch (const std::invalid_argument&) {} catch (const std::out_of_range&) {}
+    throw std::runtime_error("The number is outside the allowed range.");
+}
+
 std::optional<std::vector<std::wstring>> prompt(HWND owner, const std::wstring& title, std::span<const Field> fields) {
     const auto instance = GetModuleHandleW(nullptr);
     static const auto registered = [instance] {

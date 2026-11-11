@@ -1,10 +1,11 @@
 param(
     [string]$Toolchain = "C:\msys64\ucrt64\bin",
+    [string]$BuildDirectory = "build",
     [switch]$Test
 )
 $ErrorActionPreference = "Stop"
 $project = $PSScriptRoot
-$build = Join-Path $project "build"
+$build = if ([IO.Path]::IsPathRooted($BuildDirectory)) { $BuildDirectory } else { Join-Path $project $BuildDirectory }
 $compiler = Join-Path $Toolchain "g++.exe"
 $windres = Join-Path $Toolchain "windres.exe"
 if (!(Test-Path -LiteralPath $compiler)) { throw "Install MSYS2 UCRT64 GCC or pass -Toolchain <bin directory>." }
@@ -14,7 +15,7 @@ $resource = Join-Path $build "app-res.o"
 $common = @("-std=c++20", "-O3", "-DNDEBUG", "-Wall", "-Wextra", "-Wpedantic", "-static", "-DUNICODE",
     "-D_UNICODE", "-DNOMINMAX", "-DWIN32_LEAN_AND_MEAN", "-D_WIN32_WINNT=0x0A00", "-Isrc")
 $core = @("src/document.cpp", "src/formats.cpp", "src/psd.cpp")
-$gui = @("src/main.cpp", "src/app.cpp", "src/interface.cpp", "src/dialogs.cpp", "src/clipboard.cpp", $resource)
+$gui = @("src/main.cpp", "src/app.cpp", "src/interface.cpp", "src/dialogs.cpp", "src/new_document.cpp", "src/clipboard.cpp", "src/editing.cpp", $resource)
 $codecs = @("-lole32", "-loleaut32", "-lwindowscodecs", "-luuid")
 Push-Location $project
 try {

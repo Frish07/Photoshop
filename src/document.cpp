@@ -2,6 +2,8 @@
 
 #include <cmath>
 #include <limits>
+#include <numbers>
+#include <stdexcept>
 #include <unordered_set>
 
 namespace pf {
@@ -37,6 +39,61 @@ int blendChannel(int s, int d, Blend mode) {
     default: return s;
     }
 }
+
+class AdjustmentMap {
+public:
+    explicit AdjustmentMap(const Adjustment& value) : value_(value) {
+        if (value.kind == AdjustmentKind::hueSaturation) return;
+        for (int i = 0; i < 256; ++i) {
+            if (value.kind == AdjustmentKind::levels) {
+                const double input = std::clamp(double(i - value.first) / (value.second - value.first), 0.0, 1.0);
+                lookup_[i] = int(255 * std::pow(input, 100.0 / value.third) + 0.5);
+            } else {
+                const int contrast = (i - 128) * (100 + value.second) / 100 + 128;
+                lookup_[i] = std::clamp(contrast + value.first * 255 / 100, 0, 255);
+            }
+        }
+    }
+
+    Pixel apply(Pixel current, int opacity, Blend mode) const {
+        const int a = alpha(current);
+        if (!a || !opacity) return current;
+        const Pixel source = straight(current);
+        const auto adjusted = value_.kind == AdjustmentKind::hueSaturation ? hue(source) :
+            rgba(lookup_[red(source)], lookup_[green(source)], lookup_[blue(source)], a);
+        auto mix = [&](int before, int after) {
+            const auto mixed = blendChannel(after, before, mode);
+            return (before * (255 - opacity) + mixed * opacity + 127) / 255;
+        };
+        return premultiply(rgba(mix(red(source), red(adjusted)), mix(green(source), green(adjusted)),
+            mix(blue(source), blue(adjusted)), a));
+    }
+
+private:
+    Pixel hue(Pixel source) const {
+        const double r = red(source) / 255.0, g = green(source) / 255.0, b = blue(source) / 255.0;
+        const double high = std::max({r, g, b}), low = std::min({r, g, b});
+        const double chroma = high - low, light = (high + low) * 0.5;
+        double h = 0, s = 0;
+        if (chroma > 0) {
+            h = (high == r ? (g - b) / chroma : high == g ? 2 + (b - r) / chroma : 4 + (r - g) / chroma) / 6;
+            s = chroma / (1 - std::abs(2 * light - 1));
+        }
+        h += value_.first / 360.0;
+        h -= std::floor(h);
+        s = std::clamp(s * (1 + value_.second / 100.0), 0.0, 1.0);
+        const double l = std::clamp(light + value_.third / 100.0, 0.0, 1.0);
+        const double amplitude = s * std::min(l, 1 - l);
+        auto channel = [&](int offset) {
+            const double k = std::fmod(offset + h * 12, 12.0);
+            return std::clamp(int(255 * (l - amplitude * std::max(-1.0, std::min({k - 3, 9 - k, 1.0}))) + 0.5), 0, 255);
+        };
+        return rgba(channel(0), channel(8), channel(4), alpha(source));
+    }
+
+    Adjustment value_;
+    std::array<int, 256> lookup_{};
+};
 
 Pixel paint(Pixel dst, Pixel src, int opacity, bool erase, bool mask) {
     const int a = mul255(alpha(src), opacity);
@@ -115,17 +172,93 @@ std::size_t estimate(const State& a, const State& b) {
 }
 
 bool same(const State& a, const State& b) {
-    if (a.width != b.width || a.height != b.height || a.layers.size() != b.layers.size()) return false;
+    if (a.width != b.width || a.height != b.height || a.ppi != b.ppi || a.layers.size() != b.layers.size()) return false;
     for (std::size_t i = 0; i < a.layers.size(); ++i) {
         const auto& x = a.layers[i];
         const auto& y = b.layers[i];
         if (x.name != y.name || x.x != y.x || x.y != y.y || x.opacity != y.opacity || x.blend != y.blend ||
             x.visible != y.visible || x.locked != y.locked || x.pixels.identity() != y.pixels.identity() ||
-            x.mask.has_value() != y.mask.has_value() ||
+            x.adjustment != y.adjustment || x.mask.has_value() != y.mask.has_value() ||
             (x.mask && x.mask->identity() != y.mask->identity())) return false;
     }
     return true;
 }
+
+Plane uniformPlane(int width, int height, Pixel color) {
+    Plane plane;
+    if (!alpha(color)) return plane;
+    std::array<std::shared_ptr<Tile>, 4> patterns;
+    eachTile({0, 0, width, height}, [&](Coord coord, Rect area) {
+        const int pattern = (area.w != tileEdge) + 2 * (area.h != tileEdge);
+        auto& tile = patterns[pattern];
+        if (!tile) {
+            tile = std::make_shared<Tile>();
+            for (int y = 0; y < area.h; ++y) std::fill_n(tile->px.begin() + y * tileEdge, area.w, color);
+        }
+        plane.assign(coord, tile);
+    });
+    return plane;
+}
+
+std::optional<Pixel> uniformColor(const Plane& plane, int width, int height) {
+    if (plane.tiles().size() != std::size_t((width + tileEdge - 1) / tileEdge) * ((height + tileEdge - 1) / tileEdge))
+        return std::nullopt;
+    const auto color = plane.pixel(0, 0);
+    std::array<std::unordered_set<const Tile*>, 4> checked;
+    bool solid = true;
+    eachTile({0, 0, width, height}, [&](Coord coord, Rect area) {
+        if (!solid) return;
+        const auto tile = plane.tile(coord);
+        if (!tile) { solid = false; return; }
+        const int pattern = (area.w != tileEdge) + 2 * (area.h != tileEdge);
+        if (!checked[pattern].insert(tile).second) return;
+        for (int y = 0; y < tileEdge && solid; ++y) for (int x = 0; x < tileEdge; ++x) {
+            if (tile->px[y * tileEdge + x] != (x < area.w && y < area.h ? color : 0)) { solid = false; break; }
+        }
+    });
+    return solid ? std::optional(color) : std::nullopt;
+}
+
+Pixel sampleLinear(const Plane& input, double x, double y) {
+    const int ix = int(std::floor(x)), iy = int(std::floor(y));
+    const double fx = x - ix, fy = y - iy;
+    const Pixel a = premultiply(input.pixel(ix, iy)), b = premultiply(input.pixel(ix + 1, iy));
+    const Pixel c = premultiply(input.pixel(ix, iy + 1)), d = premultiply(input.pixel(ix + 1, iy + 1));
+    auto mix = [&](auto get) {
+        return int((1 - fy) * ((1 - fx) * get(a) + fx * get(b)) + fy * ((1 - fx) * get(c) + fx * get(d)) + 0.5);
+    };
+    return straight(rgba(mix(red), mix(green), mix(blue), mix(alpha)));
+}
+
+class InverseTransform {
+public:
+    explicit InverseTransform(TransformView view)
+        : view_(view), c_(std::cos(view.degrees * std::numbers::pi / 180)), s_(std::sin(view.degrees * std::numbers::pi / 180)),
+          centerX_(view.destination.x + view.destination.w / 2.0), centerY_(view.destination.y + view.destination.h / 2.0),
+          scaleX_(double(view.original.w) / view.destination.w), scaleY_(double(view.original.h) / view.destination.h) {}
+
+    Rect extent() const {
+        const auto& dest = view_.destination;
+        const double halfW = (std::abs(c_) * dest.w + std::abs(s_) * dest.h) / 2;
+        const double halfH = (std::abs(s_) * dest.w + std::abs(c_) * dest.h) / 2;
+        const int left = int(std::floor(centerX_ - halfW + 1e-9)), top = int(std::floor(centerY_ - halfH + 1e-9));
+        return {left, top, int(std::ceil(centerX_ + halfW - 1e-9)) - left, int(std::ceil(centerY_ + halfH - 1e-9)) - top};
+    }
+
+    bool map(int x, int y, double& sourceX, double& sourceY) const {
+        const double dx = x + 0.5 - centerX_, dy = y + 0.5 - centerY_;
+        const double u = c_ * dx + s_ * dy + view_.destination.w / 2.0;
+        const double v = -s_ * dx + c_ * dy + view_.destination.h / 2.0;
+        if (u < 0 || u >= view_.destination.w || v < 0 || v >= view_.destination.h) return false;
+        sourceX = view_.original.x + std::clamp(u * scaleX_ - 0.5, 0.0, view_.original.w - 1.0);
+        sourceY = view_.original.y + std::clamp(v * scaleY_ - 0.5, 0.0, view_.original.h - 1.0);
+        return true;
+    }
+
+private:
+    TransformView view_;
+    double c_, s_, centerX_, centerY_, scaleX_, scaleY_;
+};
 } // namespace
 
 Rect intersect(Rect a, Rect b) {
@@ -143,6 +276,15 @@ Rect between(Point a, Point b) {
     return {std::min(a.x, b.x), std::min(a.y, b.y), std::abs(a.x - b.x) + 1, std::abs(a.y - b.y) + 1};
 }
 int tileIndex(int x) { return x >= 0 ? x / tileEdge : -1 - ((-1 - x) / tileEdge); }
+
+bool validAdjustment(const Adjustment& value) {
+    if (value.kind == AdjustmentKind::levels)
+        return value.first >= 0 && value.first < value.second && value.second <= 255 && value.third >= 10 && value.third <= 1000;
+    if (value.kind == AdjustmentKind::tone)
+        return value.first >= -100 && value.first <= 100 && value.second >= -100 && value.second <= 100 && value.third == 0;
+    return value.kind == AdjustmentKind::hueSaturation && value.first >= -180 && value.first <= 180 &&
+        value.second >= -100 && value.second <= 100 && value.third >= -100 && value.third <= 100;
+}
 
 Pixel premultiply(Pixel c) {
     const int a = alpha(c);
@@ -216,6 +358,55 @@ Rect Plane::extent() const {
     for (const auto& [c, tile] : *tiles_) bounds = unite(bounds, {c.x * tileEdge, c.y * tileEdge, tileEdge, tileEdge});
     return bounds;
 }
+Rect Plane::contentBounds() const {
+    Rect bounds;
+    std::unordered_map<const Tile*, Rect> checked;
+    for (const auto& [coord, tile] : *tiles_) {
+        const auto [entry, inserted] = checked.try_emplace(tile.get());
+        auto& area = entry->second;
+        if (inserted) {
+            for (int y = 0; y < tileEdge; ++y) for (int x = 0; x < tileEdge; ++x) {
+                if (alpha(tile->px[y * tileEdge + x])) area = unite(area, {x, y, 1, 1});
+            }
+        }
+        bounds = unite(bounds, {area.x + coord.x * tileEdge, area.y + coord.y * tileEdge, area.w, area.h});
+    }
+    return bounds;
+}
+
+State blankDocument(int width, int height, double ppi, Pixel background) {
+    State state{width, height, {Layer{}}, 0, ppi};
+    state.layers[0].name = L"Layer 1";
+    if (alpha(background)) {
+        Layer layer;
+        layer.name = L"Background";
+        layer.locked = true;
+        layer.pixels = uniformPlane(width, height, background);
+        state.layers.insert(state.layers.begin(), std::move(layer));
+        state.active = 1;
+    }
+    return state;
+}
+Plane maskFromSelection(Rect canvas, const std::optional<Rect>& selection) {
+    constexpr Pixel white = 0xffffffff, black = 0xff000000;
+    Plane mask(white);
+    if (!selection) return mask;
+    auto dark = std::make_shared<Tile>();
+    dark->px.fill(black);
+    eachTile(canvas, [&](Coord coord, Rect area) {
+        const auto reveal = intersect(area, *selection);
+        if (reveal == area) return;
+        if (reveal.empty() && area.w == tileEdge && area.h == tileEdge) {
+            mask.assign(coord, dark);
+            return;
+        }
+        auto& tile = mask.edit(coord);
+        for (int y = area.y; y < area.bottom(); ++y) for (int x = area.x; x < area.right(); ++x) {
+            if (!reveal.contains({x, y})) tile.px[(y - coord.y * tileEdge) * tileEdge + x - coord.x * tileEdge] = black;
+        }
+    });
+    return mask;
+}
 
 Document::Document(State state, std::wstring label, std::size_t limit)
     : state_(std::move(state)), historyLimit_(limit) {
@@ -281,11 +472,22 @@ std::size_t Document::pixelBytes() const {
     return used.size() * sizeof(Tile);
 }
 
-Rect stamp(Layer& layer, Rect clip, float x, float y, const Brush& brush) {
+Rect stamp(Layer& layer, Rect clip, float x, float y, const Brush& brush, const CloneSample* clone) {
     const float radius = brush.diameter * 0.5f;
     Rect region{int(std::floor(x - radius)), int(std::floor(y - radius)),
         int(std::ceil(x + radius) - std::floor(x - radius)), int(std::ceil(y + radius) - std::floor(y - radius))};
     region = intersect(region, clip);
+    if (clone) {
+        auto source = clone->source.bounds();
+        source.x -= clone->offset.x; source.y -= clone->offset.y;
+        region = intersect(region, source);
+    }
+    if (region.empty()) return {};
+    std::vector<Pixel> merged;
+    if (clone && clone->merged) {
+        merged.resize(std::size_t(region.w) * region.h);
+        composite(clone->source, {region.x + clone->offset.x, region.y + clone->offset.y, region.w, region.h}, merged, region.w);
+    }
     const float inner = std::max(0.0f, radius * brush.hardness - 0.5f);
     const float outer = radius + 0.35f;
     const int opacity = int(brush.opacity * 255 + 0.5f);
@@ -295,7 +497,14 @@ Rect stamp(Layer& layer, Rect clip, float x, float y, const Brush& brush) {
         const float d2 = dx * dx + dy * dy;
         if (d2 >= outer * outer) return old;
         const float coverage = d2 <= inner * inner ? 1.0f : (outer - std::sqrt(d2)) / (outer - inner);
-        return paint(old, brush.color, int(coverage * opacity + 0.5f), brush.erase, brush.mask);
+        Pixel color = brush.color;
+        if (clone) {
+            const int gx = lx + layer.x, gy = ly + layer.y;
+            const auto& source = clone->source.layers[clone->source.active];
+            color = clone->merged ? straight(merged[std::size_t(gy - region.y) * region.w + gx - region.x]) :
+                source.pixels.pixel(gx + clone->offset.x - source.x, gy + clone->offset.y - source.y);
+        }
+        return paint(old, color, int(coverage * opacity + 0.5f), brush.erase, brush.mask);
     });
     return region;
 }
@@ -443,14 +652,18 @@ void flip(State& state, bool horizontal) {
     for (auto& layer : state.layers) {
         auto mirror = [&](const Plane& source) {
             Plane result(source.background());
+            std::unordered_map<const Tile*, std::shared_ptr<Tile>> checked;
             for (const auto& [coord, tile] : source.tiles()) {
                 Coord to = horizontal ? Coord{-coord.x - 1, coord.y} : Coord{coord.x, -coord.y - 1};
-                auto target = std::make_shared<Tile>();
-                for (int y = 0; y < tileEdge; ++y) for (int x = 0; x < tileEdge; ++x) {
-                    const int tx = horizontal ? tileEdge - 1 - x : x, ty = horizontal ? y : tileEdge - 1 - y;
-                    target->px[ty * tileEdge + tx] = tile->px[y * tileEdge + x];
+                auto& target = checked[tile.get()];
+                if (!target) {
+                    target = std::make_shared<Tile>();
+                    for (int y = 0; y < tileEdge; ++y) for (int x = 0; x < tileEdge; ++x) {
+                        const int tx = horizontal ? tileEdge - 1 - x : x, ty = horizontal ? y : tileEdge - 1 - y;
+                        target->px[ty * tileEdge + tx] = tile->px[y * tileEdge + x];
+                    }
                 }
-                result.assign(to, std::move(target));
+                result.assign(to, target);
             }
             return result;
         };
@@ -464,11 +677,15 @@ void rotateClockwise(State& state) {
     for (auto& layer : state.layers) {
         auto rotate = [](const Plane& source) {
             Plane result(source.background());
+            std::unordered_map<const Tile*, std::shared_ptr<Tile>> checked;
             for (const auto& [coord, tile] : source.tiles()) {
-                auto target = std::make_shared<Tile>();
-                for (int y = 0; y < tileEdge; ++y) for (int x = 0; x < tileEdge; ++x)
-                    target->px[x * tileEdge + (tileEdge - 1 - y)] = tile->px[y * tileEdge + x];
-                result.assign({-coord.y - 1, coord.x}, std::move(target));
+                auto& target = checked[tile.get()];
+                if (!target) {
+                    target = std::make_shared<Tile>();
+                    for (int y = 0; y < tileEdge; ++y) for (int x = 0; x < tileEdge; ++x)
+                        target->px[x * tileEdge + (tileEdge - 1 - y)] = tile->px[y * tileEdge + x];
+                }
+                result.assign({-coord.y - 1, coord.x}, target);
             }
             return result;
         };
@@ -480,6 +697,34 @@ void rotateClockwise(State& state) {
     }
     std::swap(state.width, state.height);
 }
+void transformLayer(Layer& layer, Rect original, Rect destination, double degrees) {
+    if (original.empty() || destination.empty() || destination.w > maxEdge || destination.h > maxEdge ||
+        !std::isfinite(degrees) || std::abs(degrees) > 360)
+        throw std::runtime_error("Invalid transform dimensions or angle.");
+    if (!degrees && original.w == destination.w && original.h == destination.h) {
+        layer.x += destination.x - original.x;
+        layer.y += destination.y - original.y;
+        return;
+    }
+    const InverseTransform inverse({original, destination, degrees});
+    const auto [left, top, w, h] = inverse.extent();
+    if (std::uint64_t(w) * h > maxDecodedPixels) throw std::runtime_error("The transformed layer exceeds 128 megapixels.");
+    auto transform = [&](const Plane& source) {
+        Plane out(source.background());
+        if (source.tiles().empty()) return out;
+        modify(out, {0, 0, w, h}, false, [&](Pixel before, int x, int y) {
+            double px{}, py{};
+            if (!inverse.map(x + left, y + top, px, py)) return before;
+            return sampleLinear(source, px - layer.x, py - layer.y);
+        });
+        return out;
+    };
+    layer.pixels = transform(layer.pixels);
+    if (layer.mask) layer.mask = transform(*layer.mask);
+    layer.x = left;
+    layer.y = top;
+}
+
 State resize(const State& source, int width, int height) {
     State out = source;
     out.width = width;
@@ -501,22 +746,47 @@ State resize(const State& source, int width, int height) {
             modify(result, area, false, [&](Pixel, int x, int y) {
                 const double px = std::clamp((x + 0.5) * sx - 0.5, 0.0, source.width - 1.0) - ox;
                 const double py = std::clamp((y + 0.5) * sy - 0.5, 0.0, source.height - 1.0) - oy;
-                const int ix = int(std::floor(px)), iy = int(std::floor(py));
-                const double fx = px - ix, fy = py - iy;
-                const Pixel a = premultiply(input.pixel(ix, iy)), b = premultiply(input.pixel(ix + 1, iy));
-                const Pixel c = premultiply(input.pixel(ix, iy + 1)), d = premultiply(input.pixel(ix + 1, iy + 1));
-                auto mix = [&](auto get) {
-                    return int((1 - fy) * ((1 - fx) * get(a) + fx * get(b)) +
-                        fy * ((1 - fx) * get(c) + fx * get(d)) + 0.5);
-                };
-                return straight(rgba(mix(red), mix(green), mix(blue), mix(alpha)));
+                return sampleLinear(input, px, py);
             });
             return result;
         };
-        layer.pixels = scale(layer.pixels);
+        const auto solid = ox == 0 && oy == 0 ? uniformColor(layer.pixels, source.width, source.height) : std::nullopt;
+        layer.pixels = solid ? uniformPlane(width, height, *solid) : scale(layer.pixels);
         if (layer.mask) layer.mask = scale(*layer.mask);
     }
     return out;
+}
+
+void mergeVisible(State& state, bool flatten) {
+    if (!flatten && std::none_of(state.layers.begin(), state.layers.end(), [](const Layer& layer) { return layer.visible; })) return;
+    Layer merged;
+    merged.name = flatten ? L"Background" : L"Merged";
+    merged.locked = flatten;
+    std::unordered_map<std::uint64_t, std::shared_ptr<Tile>> uniform;
+    std::array<Pixel, tileEdge * tileEdge> buffer;
+    eachTile(state.bounds(), [&](Coord coord, Rect area) {
+        auto band = std::span(buffer).first(std::size_t(area.w) * area.h);
+        composite(state, area, band, area.w);
+        for (auto& p : band) {
+            const int white = 255 - alpha(p);
+            p = flatten ? rgba(red(p) + white, green(p) + white, blue(p) + white) : straight(p);
+        }
+        const auto first = band.front();
+        if (std::all_of(band.begin(), band.end(), [&](Pixel p) { return p == first; })) {
+            if (!first) return;
+            const auto key = (std::uint64_t(first) << 16) | (std::uint64_t(area.w) << 8) | area.h;
+            auto& tile = uniform[key];
+            if (!tile) {
+                tile = std::make_shared<Tile>();
+                for (int y = 0; y < area.h; ++y) std::fill_n(tile->px.begin() + y * tileEdge, area.w, first);
+            }
+            merged.pixels.assign(coord, tile);
+        } else importPixels(merged.pixels, area, band, area.w);
+    });
+    if (flatten) state.layers.clear();
+    else std::erase_if(state.layers, [](const Layer& layer) { return layer.visible; });
+    state.layers.push_back(std::move(merged));
+    state.active = int(state.layers.size()) - 1;
 }
 
 void importPixels(Plane& plane, Rect area, std::span<const Pixel> pixels, int stride) {
@@ -528,8 +798,24 @@ void importPixels(Plane& plane, Rect area, std::span<const Pixel> pixels, int st
 void composite(const State& state, Rect area, std::span<Pixel> pixels, int stride) {
     for (int y = 0; y < area.h; ++y) std::fill_n(pixels.data() + std::size_t(y) * stride, area.w, 0);
     for (const auto& layer : state.layers) {
-        if (!layer.visible || !layer.opacity || layer.pixels.tiles().empty()) continue;
+        if (!layer.visible || !layer.opacity) continue;
         const Rect rel = local(layer, area);
+        if (layer.adjustment) {
+            const AdjustmentMap mapping(*layer.adjustment);
+            eachTile(rel, [&](Coord coord, Rect clip) {
+                const Tile* mask = layer.mask ? layer.mask->tile(coord) : nullptr;
+                for (int y = clip.y; y < clip.bottom(); ++y) {
+                    const int offset = (y - coord.y * tileEdge) * tileEdge + clip.x - coord.x * tileEdge;
+                    auto* out = pixels.data() + std::size_t(y - rel.y) * stride + clip.x - rel.x;
+                    for (int x = 0; x < clip.w; ++x) {
+                        const int opacity = mask ? mul255(layer.opacity, red(mask->px[offset + x])) : layer.opacity;
+                        out[x] = mapping.apply(out[x], opacity, layer.blend);
+                    }
+                }
+            });
+            continue;
+        }
+        if (layer.pixels.tiles().empty()) continue;
         eachTile(rel, [&](Coord coord, Rect clip) {
             auto tile = layer.pixels.tile(coord);
             if (!tile) return;
@@ -548,14 +834,32 @@ void composite(const State& state, Rect area, std::span<Pixel> pixels, int strid
         });
     }
 }
-void preview(const State& state, Rect area, int step, int width, int height, std::span<Pixel> pixels) {
-    if (step == 1) {
+void preview(const State& state, Rect area, int step, int width, int height, std::span<Pixel> pixels,
+    const TransformView* transform) {
+    if (step == 1 && !transform) {
         composite(state, area, pixels, width);
         return;
     }
     std::fill(pixels.begin(), pixels.end(), 0);
     for (const auto& layer : state.layers) {
-        if (!layer.visible || !layer.opacity || layer.pixels.tiles().empty()) continue;
+        if (!layer.visible || !layer.opacity || (!layer.adjustment && layer.pixels.tiles().empty())) continue;
+        if (transform && &layer == &state.layers[state.active]) {
+            const InverseTransform inverse(*transform);
+            if (intersect(area, inverse.extent()).empty()) continue;
+            for (int y = 0; y < height; ++y) for (int x = 0; x < width; ++x) {
+                const int gx = std::min(area.right() - 1, area.x + x * step + step / 2);
+                const int gy = std::min(area.bottom() - 1, area.y + y * step + step / 2);
+                double px{}, py{};
+                if (!inverse.map(gx, gy, px, py)) continue;
+                const int lx = int(std::round(px)) - layer.x, ly = int(std::round(py)) - layer.y;
+                auto& out = pixels[std::size_t(y) * width + x];
+                const int opacity = layer.mask ? mul255(layer.opacity, red(layer.mask->pixel(lx, ly))) : layer.opacity;
+                out = over(out, layer.pixels.pixel(lx, ly), opacity, layer.blend);
+            }
+            continue;
+        }
+        std::optional<AdjustmentMap> mapping;
+        if (layer.adjustment) mapping.emplace(*layer.adjustment);
         for (int y = 0; y < height; ++y) {
             const int iy = std::min(area.bottom() - 1, area.y + y * step + step / 2) - layer.y;
             const int ty = tileIndex(iy);
@@ -570,11 +874,11 @@ void preview(const State& state, Rect area, int step, int width, int height, std
                     tile = layer.pixels.tile({tx, ty});
                     mask = layer.mask ? layer.mask->tile({tx, ty}) : nullptr;
                 }
-                if (!tile) continue;
+                if (!tile && !mapping) continue;
                 const int i = (iy - ty * tileEdge) * tileEdge + ix - tx * tileEdge;
                 auto& out = pixels[std::size_t(y) * width + x];
                 const int opacity = mask ? mul255(layer.opacity, red(mask->px[i])) : layer.opacity;
-                out = over(out, tile->px[i], opacity, layer.blend);
+                out = mapping ? mapping->apply(out, opacity, layer.blend) : over(out, tile->px[i], opacity, layer.blend);
             }
         }
     }

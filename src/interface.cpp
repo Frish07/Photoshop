@@ -1,14 +1,15 @@
 #include "app.hpp"
 
 #include <cmath>
+#include <cwchar>
 #include <iomanip>
 #include <sstream>
 
 namespace pf {
 namespace {
-constexpr unsigned ink = 0xe6e7e9, muted = 0xabaeb5, faint = 0x81858f, border = 0x1b1c1e;
-constexpr unsigned menuBg = 0x292a2d, panelBg = 0x303134, sub = 0x35363a, fieldBg = 0x27282b;
-constexpr unsigned selected = 0x424953, blueAccent = 0x86bff4;
+constexpr unsigned ink = 0xededed, muted = 0xbcbcbc, faint = 0x929292, border = 0x1c1c1c;
+constexpr unsigned menuBg = 0x292929, panelBg = 0x323232, sub = 0x363636, fieldBg = 0x252525;
+constexpr unsigned selected = 0x444c58, blueAccent = 0x79adff, actionBlue = 0x276cde;
 constexpr float toolbarWidth = 52, ruler = 20, tabsTop = 70, tabsBottom = 104, bottomBar = 28;
 constexpr const wchar_t* labels[]{L"File", L"Edit", L"Image", L"Layer", L"Select", L"Filter", L"View", L"Window", L"Help"};
 constexpr float labelWidths[]{37, 39, 54, 49, 51, 46, 45, 66, 46};
@@ -74,8 +75,8 @@ bool App::createTarget() {
 void App::layout() {
     const auto size = target_->GetSize();
     w_ = size.width; h_ = size.height;
-    const float sidebarWidth = showPanels_ ? std::clamp(w_ * 0.208f, 244.0f, 306.0f) : 0;
-    const float toolsWidth = showPanels_ ? toolbarWidth : 0;
+    const float sidebarWidth = showPanels_ && tab() ? std::clamp(w_ * 0.208f, 244.0f, 306.0f) : 0;
+    const float toolsWidth = showPanels_ && tab() ? toolbarWidth : 0;
     sidebar_ = {w_ - sidebarWidth, tabsTop, w_, h_ - bottomBar};
     viewport_ = {toolsWidth + (showRulers_ ? ruler : 0), tabsBottom + (showRulers_ ? ruler : 0),
         sidebar_.left, h_ - bottomBar};
@@ -97,8 +98,9 @@ void App::paint() {
         if (tab()) {
             drawCanvas();
             drawRulers();
+            drawContextBar();
+            if (showPanels_) { drawToolbar(); drawSidebar(); }
         } else drawHome();
-        if (showPanels_) { drawToolbar(); drawSidebar(); }
         drawStatus();
         drawTooltip();
     } catch (...) { target_->EndDraw(); throw; }
@@ -210,6 +212,17 @@ void App::icon(Icon i, float x, float y, Color c) {
     case Icon::layers:
         l(-7, -2, 0, -6); l(0, -6, 7, -2); l(7, -2, 0, 2); l(0, 2, -7, -2);
         l(-7, 2, 0, 6); l(0, 6, 7, 2); break;
+    case Icon::clone:
+        l(-2, -1, -2, -5); l(-2, -5, 0, -7); l(0, -7, 2, -5); l(2, -5, 2, -1);
+        r(-6, -1, 12, 4); l(-7, 6, 7, 6); break;
+    case Icon::compare:
+        r(-8, -5, 16, 10); l(0, -8, 0, 8); rect(box(x - 7, y - 4, 6, 8), c, 0.45f); break;
+    case Icon::adjustment:
+        o(0, 0, 6.5f); l(-4.5f, 4.5f, 4.5f, -4.5f); o(-2.5f, -2.5f, 1.2f, true); break;
+    case Icon::transform:
+        r(-6, -6, 12, 12);
+        for (const int a : {-6, 6}) for (const int b : {-6, 6}) rect(box(x + a - 1.5f, y + b - 1.5f, 3, 3), c);
+        break;
     }
 }
 
@@ -228,12 +241,14 @@ void App::drawHeader() {
     if (w_ > 900) {
         text(box(w_ - 208, 0, 194, 30), L"PixelForge  /  Essentials", faint, 0, right);
     }
+    if (!tab()) return;
     rect(box(0, 30, w_, 40), sub);
     line(0, 30.5f, w_, 30.5f, border);
     line(0, 69.5f, w_, 69.5f, border);
     const auto tool = std::find_if(std::begin(tools), std::end(tools), [&](const ToolInfo& t) { return t.tool == tool_; });
-    icon(tool->icon, 24, 50, ink);
-    text(box(43, 30, 122, 40), tool->name, ink, 1);
+    const auto transform = tab() && tab()->transform ? &*tab()->transform : nullptr;
+    icon(transform ? Icon::transform : tool->icon, 24, 50, ink);
+    text(box(43, 30, 122, 40), transform ? L"Free Transform" : tool->name, ink, 1);
     line(166, 40, 166, 60, 0x53545a);
     x = 180;
     auto option = [&](std::wstring_view label, std::wstring value, Hit kind, int w = 62) {
@@ -243,11 +258,21 @@ void App::drawHeader() {
         button(box(x, 37, float(w), 26), value, kind, 0, false, std::wstring(label));
         x += w + 17;
     };
-    if (tool_ == Tool::brush || tool_ == Tool::eraser) {
+    if (transform) {
+        option(L"W × H", std::to_wstring(transform->box.w) + L" × " + std::to_wstring(transform->box.h), Hit::transformSize, 110);
+        button(box(x, 37, 65, 26), L"Link W/H", Hit::transformLink, 0, transform->linked, L"Maintain aspect ratio");
+        x += 76;
+        option(L"Angle", std::to_wstring(int(std::round(transform->degrees))) + L"°", Hit::transformAngle, 48);
+        iconButton(box(x, 37, 31, 26), Icon::check, Hit::command, int(Command::applyTransform), true, L"Commit transform (Enter)");
+        iconButton(box(x + 36, 37, 31, 26), Icon::close, Hit::command, int(Command::cancelTransform), false, L"Cancel transform (Esc)");
+    } else if (tool_ == Tool::brush || tool_ == Tool::eraser || tool_ == Tool::clone) {
         option(L"Size", std::to_wstring(brushSize_) + L" px", Hit::fgSize);
         option(L"Hardness", std::to_wstring(hardness_) + L"%", Hit::hardness);
         option(L"Opacity", std::to_wstring(flow_) + L"%", Hit::flow);
-        if (w_ > 930) {
+        if (tool_ == Tool::clone) {
+            button(box(x, 37, 112, 26), cloneMerged_ ? L"All Layers" : L"Current Layer", Hit::cloneSample, 0, true,
+                L"Choose which layers to sample");
+        } else if (w_ > 930) {
             circle(x + 3, 50, 7, tool_ == Tool::brush ? foreground_ : muted, tool_ == Tool::brush);
             text(box(x + 18, 30, 120, 40), tool_ == Tool::brush ? L"Soft Round" : L"Round Eraser", faint);
         }
@@ -275,6 +300,8 @@ void App::drawHeader() {
         text(box(x, 30, 290, 40), hint, muted);
     }
     if (tab()) {
+        iconButton(box(w_ - 151, 36, 32, 27), Icon::compare, Hit::command, int(Command::compare), tab()->compare,
+            L"Quick Compare (\\)");
         iconButton(box(w_ - 115, 36, 32, 27), Icon::fit, Hit::fit, 0, false, L"Fit on Screen (Ctrl+0)");
         button(box(w_ - 78, 37, 65, 26), L"Export", Hit::command, int(Command::exportFile));
     }
@@ -359,13 +386,17 @@ void App::drawSidebar() {
 }
 void App::drawColorPanel(Box area) {
     rect(box(area.left, area.top, width(area), 34), menuBg);
-    const wchar_t* names[]{L"Color", L"Swatches"};
-    for (int i = 0; i < 2; ++i) {
-        const auto r = box(area.left + i * 69, area.top, 69, 34);
-        if (i == colorTab_) { rect(r, panelBg); rect(box(r.left + 13, r.bottom - 2, 43, 2), blueAccent); }
+    const wchar_t* names[]{L"Color", L"Swatches", L"Properties"};
+    for (int i = 0; i < int(std::size(names)); ++i) {
+        const auto r = box(area.left + i * 76, area.top, 76, 34);
+        if (i == colorTab_) { rect(r, panelBg); rect(box(r.left + 13, r.bottom - 2, 50, 2), blueAccent); }
         else if (inside(r, cursor_)) rect(r, 0x3b3d41);
         text(r, names[i], i == colorTab_ ? ink : muted, i == colorTab_ ? 1 : 0, center);
         hit(r, Hit::colorTab, i);
+    }
+    if (colorTab_ == 2) {
+        drawProperties({area.left, area.top + 34, area.right, area.bottom});
+        return;
     }
     if (colorTab_ == 1) {
         constexpr unsigned colors[]{
@@ -415,6 +446,43 @@ void App::drawColorPanel(Box area) {
         L"R " + std::to_wstring(red(foreground_)) + L"  G " + std::to_wstring(green(foreground_)) +
         L"  B " + std::to_wstring(blue(foreground_)), muted, 2, right);
 }
+void App::drawProperties(Box area) {
+    const auto& state = tab()->doc.state();
+    const auto& layer = tab()->doc.active();
+    const float x = area.left + 13, top = area.top + 10, w = width(area) - 26;
+    if (layer.adjustment) {
+        const auto a = *layer.adjustment;
+        const auto name = a.kind == AdjustmentKind::tone ? L"Brightness/Contrast" :
+            a.kind == AdjustmentKind::levels ? L"Levels" : L"Hue/Saturation";
+        text(box(x, top, w, 26), name, ink, 1);
+        auto entry = [&](int row, const wchar_t* label, int number) {
+            text(box(x, top + 28 + row * 21, w, 21), label, muted, 0);
+            text(box(x, top + 28 + row * 21, w, 21), std::to_wstring(number), ink, 0, right);
+        };
+        if (a.kind == AdjustmentKind::levels) {
+            entry(0, L"Black point", a.first); entry(1, L"White point", a.second); entry(2, L"Gamma × 100", a.third);
+        } else if (a.kind == AdjustmentKind::hueSaturation) {
+            entry(0, L"Hue", a.first); entry(1, L"Saturation", a.second); entry(2, L"Lightness", a.third);
+        } else {
+            entry(0, L"Brightness", a.first); entry(1, L"Contrast", a.second);
+        }
+        button(box(x, top + 100, w, 27), L"Edit Adjustment", Hit::command, int(Command::editAdjustment), true);
+        if (height(area) >= 176) text(box(x, top + 137, w, 22), L"Paint the mask to limit the effect", faint, 2);
+        return;
+    }
+    text(box(x, top, w, 24), L"Canvas", ink, 1);
+    button(box(x, top + 28, w * 0.56f, 26), std::to_wstring(state.width) + L" × " + std::to_wstring(state.height) + L" px",
+        Hit::command, int(Command::canvasSize));
+    button(box(x + w * 0.56f + 5, top + 28, w * 0.44f - 5, 26), std::to_wstring(int(std::round(state.ppi))) + L" PPI",
+        Hit::command, int(Command::resolution));
+    line(x, top + 66, x + w, top + 66, 0x474747);
+    text(box(x, top + 71, w, 26), L"Add Adjustment Layer", ink, 1);
+    button(box(x, top + 101, w, 24), L"Brightness/Contrast", Hit::command, int(Command::addTone));
+    if (height(area) >= 166) {
+        button(box(x, top + 130, w * 0.42f, 24), L"Levels", Hit::command, int(Command::addLevels));
+        button(box(x + w * 0.42f + 5, top + 130, w * 0.58f - 5, 24), L"Hue/Saturation", Hit::command, int(Command::addHue));
+    }
+}
 void App::chequer(Box area, float size, Color c1, Color c2) {
     if (width(area) <= 0 || height(area) <= 0) return;
     rect(area, c1);
@@ -432,7 +500,8 @@ void App::thumb(Box area, const Layer& layer, bool mask) {
         const auto key = plane.identity();
         auto found = thumbs_.find(key);
         if (found == thumbs_.end() && drag_ != Drag::paint) {
-            const auto bounds = layer.pixels.extent().empty() ? Rect{0, 0, tileEdge, tileEdge} : layer.pixels.extent();
+            const auto bounds = layer.pixels.tiles().empty() ? Rect{-layer.x, -layer.y,
+                tab()->doc.state().width, tab()->doc.state().height} : layer.pixels.extent();
             std::array<Pixel, 32 * 32> pixels;
             for (int y = 0; y < 32; ++y) for (int x = 0; x < 32; ++x)
                 pixels[y * 32 + x] = plane.pixel(bounds.x + x * bounds.w / 32, bounds.y + y * bounds.h / 32);
@@ -496,7 +565,10 @@ void App::drawLayers(Box area) {
         hit(r, Hit::layer, index, L"Drag to reorder layers");
         iconButton(box(r.left + 4, r.top + 9, 23, 27), l.visible ? Icon::eye : Icon::hidden, Hit::eye, index, false, L"Toggle layer visibility");
         const auto preview = box(r.left + 34, r.top + 8, 36, 29);
-        thumb(preview, l, false);
+        if (l.adjustment) {
+            rect(preview, 0x242424);
+            icon(Icon::adjustment, preview.left + 18, preview.top + 14, ink);
+        } else thumb(preview, l, false);
         strokeRect(preview, active && !t->mask ? blueAccent : 0x202124);
         float tx = preview.right + 10;
         if (l.mask) {
@@ -548,29 +620,60 @@ void App::drawHistory(Box area) {
     line(area.left, area.bottom - 35, area.right, area.bottom - 35, border);
     text(box(area.left + 12, area.bottom - 34, width(area) - 24, 34), memory(d.historyBytes()) + L" / 96 MB history", muted, 2);
 }
-void App::cacheTile(Rect area, int step, Coord key) {
+void App::cacheTile(const State& state, Rect area, int step, Coord key, BitmapCache& cache) {
     const int w = (area.w + step - 1) / step, h = (area.h + step - 1) / step;
     std::array<Pixel, tileEdge * tileEdge> buffer;
     auto pixels = std::span(buffer).first(std::size_t(w) * h);
-    preview(tab()->doc.state(), area, step, w, h, pixels);
+    std::optional<TransformView> transform;
+    if (const auto& t = tab()->transform; &cache == &bitmaps_ && t && (t->box != t->original || t->degrees))
+        transform = TransformView{t->original, t->box, t->degrees};
+    preview(state, area, step, w, h, pixels, transform ? &*transform : nullptr);
     Bitmap entry{area, {}, frame_};
     if (std::any_of(pixels.begin(), pixels.end(), [](Pixel p) { return p != 0; })) {
         const auto props = D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
         if (FAILED(target_->CreateBitmap(D2D1::SizeU(w, h), pixels.data(), w * 4, props, entry.image.put()))) return;
     }
-    bitmaps_.emplace(key, std::move(entry));
+    cache.emplace(key, std::move(entry));
+}
+void App::drawTiles(const State& state, Box visible, int step, BitmapCache& cache) {
+    if (width(visible) <= 0 || height(visible) <= 0) return;
+    target_->PushAxisAlignedClip(visible, D2D1_ANTIALIAS_MODE_ALIASED);
+    const int edge = step * tileEdge;
+    const auto a = screenToImage({visible.left, visible.top});
+    const auto b = screenToImage({visible.right, visible.bottom});
+    const int x0 = std::max(0, int(a.x / edge)), y0 = std::max(0, int(a.y / edge));
+    const int x1 = std::min((state.width - 1) / edge, int(b.x / edge));
+    const int y1 = std::min((state.height - 1) / edge, int(b.y / edge));
+    const auto interpolation = tab()->zoom >= 1.8f ? D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR :
+        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR;
+    for (int ty = y0; ty <= y1; ++ty) for (int tx = x0; tx <= x1; ++tx) {
+        const Coord key{tx, ty};
+        auto found = cache.find(key);
+        if (found == cache.end()) {
+            cacheTile(state, intersect({tx * edge, ty * edge, edge, edge}, state.bounds()), step, key, cache);
+            found = cache.find(key);
+        }
+        if (found == cache.end()) continue;
+        auto& tile = found->second;
+        tile.touched = frame_;
+        if (tile.image) {
+            const auto p = imageToScreen(float(tile.area.x), float(tile.area.y));
+            const auto q = imageToScreen(float(tile.area.right()), float(tile.area.bottom()));
+            target_->DrawBitmap(tile.image.get(), Box{p.x, p.y, q.x, q.y}, 1, interpolation);
+        }
+    }
+    target_->PopAxisAlignedClip();
 }
 void App::drawCanvas() {
     auto t = tab();
     const auto& state = t->doc.state();
     target_->PushAxisAlignedClip(viewport_, D2D1_ANTIALIAS_MODE_ALIASED);
-    rect(viewport_, 0x202123);
+    rect(viewport_, 0x202020);
     const auto image = imageRect();
     for (int i = 9; i > 0; --i) rect(box(image.left - i / 2.0f, image.top + 2 - i / 4.0f,
         width(image) + i, height(image) + i), 0x070809, 0.035f);
     const auto visible = overlap(viewport_, image);
     if (width(visible) > 0 && height(visible) > 0) {
-        target_->PushAxisAlignedClip(visible, D2D1_ANTIALIAS_MODE_ALIASED);
         if (!checkerBrush_) {
             std::array<Pixel, 20 * 20> pattern;
             for (int y = 0; y < 20; ++y) for (int x = 0; x < 20; ++x)
@@ -580,53 +683,70 @@ void App::drawCanvas() {
                 target_->CreateBitmapBrush(checker_.get(), D2D1::BitmapBrushProperties(D2D1_EXTEND_MODE_WRAP,
                     D2D1_EXTEND_MODE_WRAP, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR), checkerBrush_.put());
         }
-        if (checkerBrush_) {
-            checkerBrush_->SetTransform(D2D1::Matrix3x2F::Translation(image.left, image.top));
-            target_->FillRectangle(visible, checkerBrush_.get());
-        } else rect(visible, 0xb8b8b8);
+        auto checker = [&](Box area) {
+            if (width(area) <= 0 || height(area) <= 0) return;
+            if (checkerBrush_) {
+                checkerBrush_->SetTransform(D2D1::Matrix3x2F::Translation(image.left, image.top));
+                target_->FillRectangle(area, checkerBrush_.get());
+            } else rect(area, 0xb8b8b8);
+        };
         int step = 1;
         while (step * t->zoom < 0.59f && step < 64) step *= 2;
         auto visibleTiles = [&](int level) {
             const float edge = tileEdge * level * t->zoom;
             return (std::ceil(width(visible) / edge) + 1) * (std::ceil(height(visible) / edge) + 1);
         };
-        while (visibleTiles(step) > 460 && step < 64) step *= 2;
-        if (step != lod_) { bitmaps_.clear(); lod_ = step; }
-        const int edge = step * tileEdge;
-        const auto a = screenToImage({visible.left, visible.top});
-        const auto b = screenToImage({visible.right, visible.bottom});
-        const int x0 = std::max(0, int(a.x / edge)), y0 = std::max(0, int(a.y / edge));
-        const int x1 = std::min((state.width - 1) / edge, int(b.x / edge));
-        const int y1 = std::min((state.height - 1) / edge, int(b.y / edge));
-        for (int ty = y0; ty <= y1; ++ty) for (int tx = x0; tx <= x1; ++tx) {
-            const Coord key{tx, ty};
-            auto found = bitmaps_.find(key);
-            if (found == bitmaps_.end()) {
-                cacheTile(intersect({tx * edge, ty * edge, edge, edge}, state.bounds()), step, key);
-                found = bitmaps_.find(key);
+        while (visibleTiles(step) > (t->compare ? 220 : 460) && step < 64) step *= 2;
+        while (t->transform && width(visible) * height(visible) / std::pow(t->zoom * step, 2) > 460000 && step < 64) step *= 2;
+        if (step != lod_) { bitmaps_.clear(); beforeBitmaps_.clear(); lod_ = step; }
+        if (t->compare) {
+            const float divider = visible.left + width(visible) * t->split;
+            const Box after{divider, visible.top, visible.right, visible.bottom};
+            const auto& original = t->doc.historyStart();
+            const auto end = imageToScreen(float(original.width), float(original.height));
+            const Box before = overlap({visible.left, visible.top, divider, visible.bottom}, {image.left, image.top, end.x, end.y});
+            checker(before);
+            drawTiles(original, before, step, beforeBitmaps_);
+            checker(after);
+            drawTiles(state, after, step, bitmaps_);
+            line(divider, visible.top, divider, visible.bottom, 0x171717, 3);
+            line(divider, visible.top, divider, visible.bottom, ink, 1.4f);
+            const float y = (visible.top + visible.bottom) / 2;
+            rounded(box(divider - 15, y - 12, 30, 24), 11, 0x282828);
+            icon(Icon::swap, divider, y, ink);
+            hit(box(divider - 7, visible.top, 14, height(visible)), Hit::compareSlider, 0, L"Drag to compare before and after");
+            hit(box(divider - 16, y - 14, 32, 28), Hit::compareSlider);
+            if (width(visible) > 260 && height(visible) > 58) {
+                const bool first = t->doc.historyStartId() == 0;
+                const float w = first ? 55 : 91;
+                if (divider - visible.left > w + 16) {
+                    const auto label = box(visible.left + 8, visible.top + 8, w, 22);
+                    rounded(label, 5, 0x222222, 0.88f);
+                    text(label, first ? L"Before" : L"History Start", ink, 2, center);
+                }
+                if (visible.right - divider > 64) {
+                    const auto label = box(visible.right - 57, visible.top + 8, 49, 22);
+                    rounded(label, 5, 0x222222, 0.88f);
+                    text(label, L"After", ink, 2, center);
+                }
             }
-            if (found == bitmaps_.end()) continue;
-            auto& tile = found->second;
-            tile.touched = frame_;
-            if (tile.image) {
-                const auto p = imageToScreen(float(tile.area.x), float(tile.area.y));
-                const auto q = imageToScreen(float(tile.area.right()), float(tile.area.bottom()));
-                const auto interpolation = t->zoom >= 1.8f ? D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR :
-                    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR;
-                target_->DrawBitmap(tile.image.get(), Box{p.x, p.y, q.x, q.y}, 1, interpolation);
-            }
+        } else {
+            checker(visible);
+            drawTiles(state, visible, step, bitmaps_);
         }
-        target_->PopAxisAlignedClip();
     }
-    if (bitmaps_.size() > 480) {
+    auto trim = [&](BitmapCache& cache, std::size_t limit) {
+        if (cache.size() <= limit) return;
         std::vector<std::pair<std::uint64_t, Coord>> order;
-        for (const auto& [key, entry] : bitmaps_) if (entry.touched != frame_) order.emplace_back(entry.touched, key);
+        for (const auto& [key, entry] : cache) if (entry.touched != frame_) order.emplace_back(entry.touched, key);
         std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
         for (const auto& entry : order) {
-            if (bitmaps_.size() <= 480) break;
-            bitmaps_.erase(entry.second);
+            if (cache.size() <= limit) break;
+            cache.erase(entry.second);
         }
-    }
+    };
+    trim(bitmaps_, t->compare ? 240 : 480);
+    trim(beforeBitmaps_, 240);
     strokeRect(image, 0x141517);
     auto screen = [&](Rect area) {
         const auto p = imageToScreen(float(area.x), float(area.y));
@@ -673,13 +793,66 @@ void App::drawCanvas() {
         line(down_.x, down_.y, cursor_.x, cursor_.y, ink);
         circle(down_.x, down_.y, 4, ink); circle(cursor_.x, cursor_.y, 4, ink);
     }
-    if (inside(viewport_, cursor_) && inside(image, cursor_) && !space_ &&
-        (tool_ == Tool::brush || tool_ == Tool::eraser) && (drag_ == Drag::none || drag_ == Drag::paint)) {
+    if (tool_ == Tool::clone && t->cloneSource && !t->transform) {
+        const auto anchor = *t->cloneSource;
+        const auto pos = drag_ == Drag::paint ? imagePoint(cursor_) : anchor;
+        const auto offset = drag_ == Drag::paint ? cloneOffset_ : Point{};
+        const auto p = imageToScreen(pos.x + offset.x + 0.5f, pos.y + offset.y + 0.5f);
+        line(p.x - 7, p.y, p.x + 7, p.y, 0x151515, 2.8f);
+        line(p.x, p.y - 7, p.x, p.y + 7, 0x151515, 2.8f);
+        line(p.x - 7, p.y, p.x + 7, p.y, ink);
+        line(p.x, p.y - 7, p.x, p.y + 7, ink);
+    }
+    if (t->transform) drawTransform();
+    if (!t->transform && inside(viewport_, cursor_) && inside(image, cursor_) && !space_ &&
+        (tool_ == Tool::brush || tool_ == Tool::eraser || tool_ == Tool::clone) && (drag_ == Drag::none || drag_ == Drag::paint)) {
         const float radius = std::max(2.0f, brushSize_ * t->zoom / 2);
         circle(cursor_.x, cursor_.y, radius, 0x151618, false, 2.2f);
         circle(cursor_.x, cursor_.y, radius, 0xf4f4f4, false, 1);
     }
     target_->PopAxisAlignedClip();
+}
+void App::drawTransform() {
+    const auto handles = transformHandles();
+    for (int i = 0; i < 8; i += 2) {
+        const auto a = handles[i], b = handles[(i + 2) % 8];
+        line(a.x, a.y, b.x, b.y, 0x202020, 2.6f);
+        line(a.x, a.y, b.x, b.y, blueAccent, 1.2f);
+    }
+    for (int i = 0; i < 8; ++i) {
+        const auto p = handles[i];
+        const auto handle = box(p.x - 3.5f, p.y - 3.5f, 7, 7);
+        rect(handle, ink);
+        strokeRect(handle, actionBlue);
+    }
+    line(handles[1].x, handles[1].y, handles[8].x, handles[8].y, blueAccent, 1.4f);
+    circle(handles[8].x, handles[8].y, 4.5f, ink, true);
+    circle(handles[8].x, handles[8].y, 4.5f, actionBlue);
+}
+void App::drawContextBar() {
+    const auto t = tab();
+    if (!showContextBar_ || !showPanels_ || width(viewport_) < 385 || drag_ != Drag::none) return;
+    struct Action { const wchar_t* name; Command command; };
+    std::array<Action, 3> actions;
+    if (t->transform) actions = {{{L"Apply Transform", Command::applyTransform}, {L"Cancel", Command::cancelTransform}, {L"", Command::none}}};
+    else if (t->cropBox) actions = {{{L"Apply Crop", Command::cropSelection}, {L"Cancel", Command::deselect}, {L"", Command::none}}};
+    else if (t->doc.selection) actions = {{{L"Deselect", Command::deselect}, {L"Crop", Command::cropSelection}, {L"Copy", Command::copy}}};
+    else if (t->doc.active().adjustment) actions = {{{L"Edit Adjustment", Command::editAdjustment}, {L"New Layer", Command::addLayer}, {L"", Command::none}}};
+    else if (t->doc.active().locked) actions = {{{L"Unlock Layer", Command::toggleLock}, {L"New Layer", Command::addLayer}, {L"Place Image", Command::place}}};
+    else actions = {{{L"New Layer", Command::addLayer}, {L"Place Image", Command::place}, {L"Add Adjustment", Command::addTone}}};
+    float w = 16;
+    for (auto a : actions) if (a.command != Command::none) w += 22 + float(std::wcslen(a.name)) * 6.5f;
+    const auto image = imageRect();
+    const float x = (viewport_.left + viewport_.right - w) / 2;
+    const float y = std::clamp(image.bottom + 11, viewport_.top + 12, viewport_.bottom - 48);
+    rounded(box(x + 1, y + 2, w, 36), 7, 0x0a0a0a, 0.65f);
+    rounded(box(x, y, w, 36), 7, 0x373737);
+    float left = x + 8;
+    for (auto a : actions) if (a.command != Command::none) {
+        const float bw = 17 + float(std::wcslen(a.name)) * 6.5f;
+        button(box(left, y + 6, bw, 24), a.name, Hit::command, int(a.command));
+        left += bw + 5;
+    }
 }
 void App::drawRulers() {
     if (!showRulers_) return;
@@ -724,15 +897,18 @@ void App::drawRulers() {
     line(vertical.right - 0.5f, vertical.top, vertical.right - 0.5f, vertical.bottom, border);
 }
 void App::drawHome() {
-    const float x = (viewport_.left + viewport_.right) / 2;
-    const float y = (viewport_.top + viewport_.bottom) / 2 - 75;
-    rounded(box(x - 23, y - 40, 46, 43), 9, 0x16304a);
-    text(box(x - 23, y - 40, 46, 43), L"Px", blueAccent, 3, center);
-    text(box(x - 230, y + 11, 460, 49), L"PixelForge", ink, 4, center);
-    text(box(x - 200, y + 63, 400, 23), L"Drop an image here to start editing", muted, 6, center);
-    button(box(x - 135, y + 106, 130, 35), L"New Document", Hit::command, int(Command::newDoc), true);
-    button(box(x + 5, y + 106, 130, 35), L"Open Image", Hit::command, int(Command::open));
-    button(box(x - 65, y + 153, 130, 30), L"Open Sample", Hit::command, int(Command::demo));
+    constexpr float rail = 202;
+    rect(box(0, 30, rail, h_ - 30 - bottomBar), 0x292929);
+    line(rail, 30, rail, h_ - bottomBar, border);
+    const auto create = box(22, 62, rail - 44, 35);
+    rounded(create, 17, inside(create, cursor_) ? 0x377de8 : actionBlue);
+    text(create, L"New File", ink, 1, center);
+    hit(create, Hit::command, int(Command::newDoc), L"New Document (Ctrl+N)");
+    button(box(22, 109, rail - 44, 34), L"Open", Hit::command, int(Command::open), false, L"Open Image (Ctrl+O)");
+    const float x = (w_ + rail) / 2, y = (h_ - bottomBar + 30) / 2 - 54;
+    icon(Icon::image, x, y, blueAccent);
+    text(box(x - 220, y + 19, 440, 46), L"Start a new document", ink, 4, center);
+    text(box(x - 245, y + 72, 490, 27), L"Choose a preset or drop an image here to open it.", muted, 6, center);
 }
 void App::drawStatus() {
     const float y = h_ - bottomBar;
@@ -748,11 +924,12 @@ void App::drawStatus() {
     button(box(104, y + 4, 23, 20), L"+", Hit::zoom, 1);
     line(138, y + 7, 138, y + 21, 0x47484d);
     const auto& d = t->doc.state();
-    const auto dimensions = std::to_wstring(d.width) + L" × " + std::to_wstring(d.height) + L" px  ·  RGB / 8";
-    text(box(150, y, 200, bottomBar), dimensions, muted, 2);
+    const auto dimensions = std::to_wstring(d.width) + L" × " + std::to_wstring(d.height) + L" px  ·  " +
+        std::to_wstring(int(std::round(d.ppi))) + L" PPI  ·  RGB / 8";
+    text(box(150, y, 238, bottomBar), dimensions, muted, 2);
     if (inside(viewport_, cursor_) && inside(imageRect(), cursor_)) {
         const auto p = imagePoint(cursor_);
-        text(box(352, y, 185, bottomBar), L"X " + std::to_wstring(p.x) + L"   Y " + std::to_wstring(p.y), faint, 2);
+        text(box(397, y, 182, bottomBar), L"X " + std::to_wstring(p.x) + L"   Y " + std::to_wstring(p.y), faint, 2);
     }
     text(box(w_ - 235, y, 220, bottomBar), L"Pixel data  " + memory(memory_), muted, 2, right);
 }

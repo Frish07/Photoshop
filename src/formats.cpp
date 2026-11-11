@@ -3,12 +3,13 @@
 #include "platform.hpp"
 
 #include <wincodec.h>
+#include <cmath>
 #include <cwctype>
 
 namespace pf {
 namespace {
 namespace fs = std::filesystem;
-constexpr std::string_view signature = "PXFORGE2";
+constexpr std::string_view signature = "PXFORGE3";
 constexpr std::size_t projectTileLimit = (1024ull << 20) / sizeof(Tile);
 constexpr std::size_t projectReferenceLimit = 1'000'000;
 
@@ -133,14 +134,16 @@ Plane readPlane(Reader& in, Pixel background, std::vector<std::shared_ptr<Tile>>
 State readProject(const fs::path& path) {
     Reader in(path);
     const auto magic = in.str(signature.size());
-    require(magic == signature || magic == "PXFORGE1", "Invalid PixelForge project.");
+    require(magic == signature || magic == "PXFORGE2" || magic == "PXFORGE1", "Invalid PixelForge project.");
     State state;
     state.width = in.i32();
     state.height = in.i32();
     const auto count = in.u16();
     state.active = in.u16();
+    if (magic == signature) state.ppi = in.u32() / 1000.0;
     require(state.width > 0 && state.height > 0 && state.width <= maxEdge && state.height <= maxEdge &&
-        count > 0 && count <= maxLayers && state.active < count, "Invalid project dimensions or layer count.");
+        count > 0 && count <= maxLayers && state.active < count && state.ppi >= 1 && state.ppi <= 2400,
+        "Invalid project dimensions, resolution or layer count.");
     std::size_t remainingReferences = projectReferenceLimit;
     std::vector<std::shared_ptr<Tile>> dictionary;
     state.layers.reserve(count);
@@ -152,11 +155,15 @@ State readProject(const fs::path& path) {
         layer.blend = Blend(in.u8());
         const auto flags = in.u8();
         require(layer.x >= -maxEdge * 64 && layer.x <= maxEdge * 64 && layer.y >= -maxEdge * 64 &&
-            layer.y <= maxEdge * 64 && layer.blend <= Blend::difference && flags <= 7, "Invalid layer metadata.");
+            layer.y <= maxEdge * 64 && layer.blend <= Blend::difference && flags <= (magic == signature ? 15 : 7), "Invalid layer metadata.");
         layer.visible = (flags & 1) != 0;
         layer.locked = (flags & 2) != 0;
-        layer.pixels = readPlane(in, 0, dictionary, remainingReferences, magic == signature);
-        if (flags & 4) layer.mask = readPlane(in, 0xffffffff, dictionary, remainingReferences, magic == signature);
+        if (flags & 8) {
+            layer.adjustment = Adjustment{AdjustmentKind(in.u8()), in.i32(), in.i32(), in.i32()};
+            require(validAdjustment(*layer.adjustment), "Invalid adjustment layer settings.");
+        }
+        layer.pixels = readPlane(in, 0, dictionary, remainingReferences, magic != "PXFORGE1");
+        if (flags & 4) layer.mask = readPlane(in, 0xffffffff, dictionary, remainingReferences, magic != "PXFORGE1");
         state.layers.push_back(std::move(layer));
     }
     return state;
@@ -174,6 +181,8 @@ State decode(IWICImagingFactory* wic, IWICBitmapDecoder* decoder, std::wstring n
     check(converter->Initialize(frame.get(), GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, nullptr,
         0, WICBitmapPaletteTypeCustom), "This pixel format is not supported.");
     State state{int(width), int(height), {Layer{}}};
+    double dpiX{}, dpiY{};
+    if (SUCCEEDED(frame->GetResolution(&dpiX, &dpiY)) && dpiX >= 1 && dpiX <= 2400) state.ppi = dpiX;
     auto& layer = state.layers.front();
     layer.name = std::move(name);
     constexpr int rows = 24;
@@ -210,6 +219,7 @@ void encode(const State& state, const fs::path& path, const GUID& codec) {
     }
     check(frame->Initialize(properties.get()), "Unable to initialize the image frame.");
     check(frame->SetSize(state.width, state.height), "The encoder does not support this image size.");
+    check(frame->SetResolution(state.ppi, state.ppi), "Unable to set the output resolution.");
     WICPixelFormatGUID format = codec == GUID_ContainerFormatPng || codec == GUID_ContainerFormatTiff
         ? GUID_WICPixelFormat32bppBGRA : GUID_WICPixelFormat24bppBGR;
     check(frame->SetPixelFormat(&format), "Unable to select an export pixel format.");
@@ -273,6 +283,8 @@ void save(const State& state, const fs::path& path) {
         out.str(signature);
         out.u32(state.width); out.u32(state.height);
         out.u16(std::uint16_t(state.layers.size())); out.u16(std::uint16_t(state.active));
+        require(std::isfinite(state.ppi) && state.ppi >= 1 && state.ppi <= 2400, "Invalid document resolution.");
+        out.u32(std::uint32_t(std::round(state.ppi * 1000)));
         std::unordered_map<const Tile*, std::uint32_t> dictionary;
         std::size_t remainingReferences = projectReferenceLimit;
         for (const auto& layer : state.layers) {
@@ -283,7 +295,12 @@ void save(const State& state, const fs::path& path) {
             out.u16(std::uint16_t(name.size())); out.str(name);
             out.u32(layer.x); out.u32(layer.y); out.u8(std::uint8_t(layer.opacity));
             out.u8(std::uint8_t(layer.blend));
-            out.u8(std::uint8_t((layer.visible ? 1 : 0) | (layer.locked ? 2 : 0) | (layer.mask ? 4 : 0)));
+            out.u8(std::uint8_t((layer.visible ? 1 : 0) | (layer.locked ? 2 : 0) | (layer.mask ? 4 : 0) | (layer.adjustment ? 8 : 0)));
+            if (layer.adjustment) {
+                const auto& value = *layer.adjustment;
+                require(validAdjustment(value), "Invalid adjustment layer settings.");
+                out.u8(std::uint8_t(value.kind)); out.u32(value.first); out.u32(value.second); out.u32(value.third);
+            }
             writePlane(out, layer.pixels, dictionary, remainingReferences);
             if (layer.mask) writePlane(out, *layer.mask, dictionary, remainingReferences);
         }
@@ -293,7 +310,16 @@ void save(const State& state, const fs::path& path) {
 void exportImage(const State& state, const fs::path& path) {
     const auto e = extension(path);
     if (e == L".psd") {
-        atomicWrite(path, [&](const fs::path& temp) { savePsd(state, temp); });
+        atomicWrite(path, [&](const fs::path& temp) {
+            if (std::any_of(state.layers.begin(), state.layers.end(), [](const Layer& layer) { return bool(layer.adjustment); })) {
+                State raster = state;
+                if (std::any_of(raster.layers.begin(), raster.layers.end(), [](const Layer& layer) { return layer.visible && layer.adjustment; }))
+                    mergeVisible(raster, false);
+                std::erase_if(raster.layers, [](const Layer& layer) { return bool(layer.adjustment); });
+                if (raster.layers.empty()) raster.layers.emplace_back();
+                savePsd(raster, temp);
+            } else savePsd(state, temp);
+        });
         return;
     }
     const auto& codec = e == L".png" ? GUID_ContainerFormatPng

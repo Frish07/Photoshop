@@ -16,7 +16,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         int argc{};
         auto argv = CommandLineToArgvW(GetCommandLineW(), &argc);
         try {
-            if (argc <= 1) app.openDemo();
+            if (argc <= 1) app.createDocument();
             for (int i = 1; i < argc; ++i) app.openPath(argv[i]);
         } catch (const std::exception& e) {
             MessageBoxA(nullptr, e.what(), "PixelForge", MB_ICONWARNING | MB_OK);

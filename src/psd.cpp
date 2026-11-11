@@ -1,6 +1,7 @@
 #include "formats.hpp"
 #include "binary.hpp"
 
+#include <cmath>
 #include <numeric>
 
 namespace pf {
@@ -25,6 +26,25 @@ int signed16(std::uint16_t value) { return value >= 32768 ? int(value) - 65536 :
 std::uint64_t section(Reader& file, std::uint64_t length, std::uint64_t end) {
     require(file.pos() <= end && length <= end - file.pos(), "Invalid PSD section length.");
     return file.pos() + length;
+}
+double readResolution(Reader& in) {
+    const auto end = section(in, in.u32(), in.limit());
+    double ppi = 72;
+    while (in.pos() + 12 <= end && in.str(4) == "8BIM") {
+        const auto id = in.u16();
+        const auto name = in.u8();
+        in.seek(section(in, name + (name % 2 == 0), end));
+        const auto size = in.u32();
+        const auto blockEnd = section(in, size, end);
+        if (id == 1005 && size >= 16) {
+            const auto resolution = in.u32() / 65536.0;
+            if (resolution >= 1 && resolution <= 2400) ppi = resolution;
+        }
+        in.seek(blockEnd);
+        if (size % 2 && in.pos() < end) in.skip(1);
+    }
+    in.seek(end);
+    return ppi;
 }
 Rect rectangle(Reader& in) {
     const int top = in.i32(), left = in.i32(), bottom = in.i32(), right = in.i32();
@@ -258,7 +278,8 @@ State loadPsd(const std::filesystem::path& path) {
     require(channels >= (mode == 3 ? 3 : 1) && channels <= 56 && state.width > 0 && state.height > 0 &&
         state.width <= maxEdge && state.height <= maxEdge &&
         std::uint64_t(state.width) * state.height <= maxDecodedPixels, "PSD dimensions exceed the decoding limit.");
-    in.skip(in.u32()); in.skip(in.u32());
+    in.skip(in.u32());
+    state.ppi = readResolution(in);
     const auto layerEnd = section(in, in.u32(), in.limit());
     bool hasAlpha = false;
     std::vector<Record> records;
@@ -312,12 +333,15 @@ void savePsd(const State& state, const std::filesystem::path& path) {
         layerInfo += 58 + extraSize(*i) + 4 * (2 + std::uint64_t(area.w) * area.h);
     }
     const auto rounded = (layerInfo + 1) & ~1ull;
-    require(rounded + 50 + 4ull * state.width * state.height <= psdLimit, "This export would exceed the 2 GB PSD limit.");
+    require(rounded + 78 + 4ull * state.width * state.height <= psdLimit, "This export would exceed the 2 GB PSD limit.");
     Writer out(path);
     out.str("8BPS"); out.u16(1);
     for (int i = 0; i < 6; ++i) out.u8(0);
     out.u16(4); out.u32(state.height); out.u32(state.width); out.u16(8); out.u16(3);
-    out.u32(0); out.u32(0);
+    out.u32(0); out.u32(28);
+    out.str("8BIM"); out.u16(1005); out.u16(0); out.u32(16);
+    const auto resolution = std::uint32_t(std::round(state.ppi * 65536));
+    for (int axis = 0; axis < 2; ++axis) { out.u32(resolution); out.u16(1); out.u16(1); }
     out.u32(std::uint32_t(rounded + 8)); out.u32(std::uint32_t(rounded));
     out.u16(std::uint16_t(-int(state.layers.size())));
     for (std::size_t i = 0; i < bounds.size(); ++i)

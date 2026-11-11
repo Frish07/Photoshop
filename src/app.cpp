@@ -21,22 +21,29 @@ constexpr MenuItem editMenu[] = {{Command::undo, L"Undo\tCtrl+Z"}, {Command::red
     {Command::none, nullptr}, {Command::cut, L"Cut\tCtrl+X"}, {Command::copy, L"Copy\tCtrl+C"},
     {Command::copyMerged, L"Copy Merged\tCtrl+Shift+C"},
     {Command::paste, L"Paste\tCtrl+V"}, {Command::clear, L"Clear\tDelete"},
-    {Command::fillFG, L"Fill Foreground\tAlt+Backspace"}, {Command::fillBG, L"Fill Background\tCtrl+Backspace"}};
+    {Command::fillFG, L"Fill Foreground\tAlt+Backspace"}, {Command::fillBG, L"Fill Background\tCtrl+Backspace"},
+    {Command::none, nullptr}, {Command::freeTransform, L"Free Transform\tCtrl+T"}};
 constexpr MenuItem imageMenu[] = {{Command::resize, L"Image Size...\tCtrl+Alt+I"}, {Command::canvasSize, L"Canvas Size..."},
+    {Command::resolution, L"Resolution..."},
     {Command::rotate, L"Rotate Canvas 90° Clockwise"},
     {Command::flipX, L"Flip Canvas Horizontal"}, {Command::flipY, L"Flip Canvas Vertical"},
     {Command::cropSelection, L"Crop to Selection"}};
 constexpr MenuItem layerMenu[] = {{Command::addLayer, L"New Layer\tCtrl+Shift+N"}, {Command::place, L"Place Image..."},
     {Command::duplicate, L"Duplicate Layer\tCtrl+J"}, {Command::rename, L"Rename Layer..."}, {Command::deleteLayer, L"Delete Layer"},
     {Command::none, nullptr}, {Command::layerUp, L"Bring Forward\tCtrl+]"}, {Command::layerDown, L"Send Backward\tCtrl+["},
-    {Command::toggleLock, L"Toggle Layer Lock"}, {Command::addMask, L"Add Layer Mask"}, {Command::removeMask, L"Delete Layer Mask"}};
+    {Command::toggleLock, L"Toggle Layer Lock"}, {Command::addMask, L"Add Layer Mask"}, {Command::removeMask, L"Delete Layer Mask"},
+    {Command::none, nullptr}, {Command::editAdjustment, L"Edit Adjustment..."},
+    {Command::mergeVisible, L"Merge Visible\tCtrl+Shift+E"}, {Command::flatten, L"Flatten Image"}};
+constexpr MenuItem adjustmentsMenu[] = {{Command::addTone, L"Brightness/Contrast..."}, {Command::addLevels, L"Levels..."},
+    {Command::addHue, L"Hue/Saturation..."}};
 constexpr MenuItem selectMenu[] = {{Command::selectAll, L"All\tCtrl+A"}, {Command::deselect, L"Deselect\tCtrl+D"}};
 constexpr MenuItem filterMenu[] = {{Command::brightness, L"Brightness..."}, {Command::contrast, L"Contrast..."},
     {Command::gray, L"Desaturate\tCtrl+Shift+U"}, {Command::invert, L"Invert\tCtrl+I"},
     {Command::none, nullptr}, {Command::blur, L"Box Blur..."}};
 constexpr MenuItem viewMenu[] = {{Command::fit, L"Fit on Screen\tCtrl+0"}, {Command::actual, L"100%\tCtrl+1"},
-    {Command::zoomIn, L"Zoom In\tCtrl++"}, {Command::zoomOut, L"Zoom Out\tCtrl+-"}, {Command::rulers, L"Rulers\tCtrl+R"}};
-constexpr MenuItem windowMenu[] = {{Command::panels, L"Show Panels\tTab"}};
+    {Command::zoomIn, L"Zoom In\tCtrl++"}, {Command::zoomOut, L"Zoom Out\tCtrl+-"}, {Command::rulers, L"Rulers\tCtrl+R"},
+    {Command::none, nullptr}, {Command::compare, L"Quick Compare\t\\"}};
+constexpr MenuItem windowMenu[] = {{Command::panels, L"Show Panels\tTab"}, {Command::contextBar, L"Contextual Task Bar"}};
 constexpr MenuItem helpMenu[] = {{Command::about, L"About PixelForge"}};
 constexpr std::span<const MenuItem> menus[]{fileMenu, editMenu, imageMenu, layerMenu, selectMenu, filterMenu,
     viewMenu, windowMenu, helpMenu};
@@ -47,12 +54,6 @@ bool control() { return pressed(VK_CONTROL); }
 bool shift() { return pressed(VK_SHIFT); }
 bool alt() { return pressed(VK_MENU); }
 
-int readNumber(const std::wstring& text, int low, int high) {
-    std::size_t end{};
-    const int value = std::stoi(text, &end);
-    if (end != text.size() || value < low || value > high) throw std::runtime_error("The number is outside the allowed range.");
-    return value;
-}
 } // namespace
 
 Tab::Tab(State state, std::wstring name, std::wstring history)
@@ -63,6 +64,7 @@ App::App(HINSTANCE instance) : instance_(instance) { updateHSV(); }
 bool App::create(int show) {
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
+    wc.style = CS_DBLCLKS;
     wc.hInstance = instance_;
     wc.lpfnWndProc = windowProc;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
@@ -80,7 +82,7 @@ bool App::create(int show) {
     if (!window_) return false;
     BOOL dark = TRUE;
     DwmSetWindowAttribute(window_, 20, &dark, sizeof(dark));
-    COLORREF border = RGB(37, 38, 41), caption = RGB(26, 27, 30);
+    COLORREF border = RGB(42, 42, 42), caption = RGB(32, 32, 32);
     DwmSetWindowAttribute(window_, 34, &border, sizeof(border));
     DwmSetWindowAttribute(window_, 35, &caption, sizeof(caption));
     ShowWindow(window_, show);
@@ -135,6 +137,22 @@ LRESULT App::message(UINT msg, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_LBUTTONDOWN: leftDown(mouse(l)); return 0;
+    case WM_LBUTTONDBLCLK: {
+        const auto p = mouse(l);
+        if (tab()) for (auto i = hits_.rbegin(); i != hits_.rend(); ++i) {
+            if (!inside(i->rect, p)) continue;
+            if (i->kind == Hit::layer) {
+                tab()->doc.select(i->id);
+                tab()->mask = false;
+                command(tab()->doc.active().adjustment ? Command::editAdjustment : Command::rename);
+                repaint();
+                return 0;
+            }
+            break;
+        }
+        leftDown(p);
+        return 0;
+    }
     case WM_MBUTTONDOWN: leftDown(mouse(l), true); return 0;
     case WM_LBUTTONUP: case WM_MBUTTONUP: leftUp(mouse(l)); return 0;
     case WM_RBUTTONUP: {
@@ -144,6 +162,7 @@ LRESULT App::message(UINT msg, WPARAM w, LPARAM l) {
             if (i->kind == Hit::layer && inside(i->rect, p)) {
                 tab()->doc.select(i->id);
                 tab()->mask = false;
+                resetTransform();
                 menu(3, p, true);
                 break;
             }
@@ -207,7 +226,7 @@ LRESULT App::message(UINT msg, WPARAM w, LPARAM l) {
 }
 
 void App::repaint() { InvalidateRect(window_, nullptr, FALSE); }
-void App::clearCache() { bitmaps_.clear(); thumbs_.clear(); }
+void App::clearCache() { bitmaps_.clear(); beforeBitmaps_.clear(); thumbs_.clear(); }
 void App::invalidate(Rect dirty) {
     std::erase_if(bitmaps_, [&](const auto& entry) { return !intersect(entry.second.area, dirty).empty(); });
     repaint();
@@ -216,6 +235,8 @@ void App::documentChanged(bool pixels) {
     if (pixels) clearCache();
     if (auto t = tab()) {
         if (!t->doc.active().mask) t->mask = false;
+        if (t->cloneSource && !t->doc.state().bounds().contains(*t->cloneSource)) t->cloneSource.reset();
+        if (t->doc.historyStartId() != compareId_) { beforeBitmaps_.clear(); compareId_ = t->doc.historyStartId(); }
         memory_ = t->doc.pixelBytes();
     } else memory_ = 0;
     updateTitle();
@@ -372,6 +393,7 @@ void App::zoomAt(float value, Vec at) {
 }
 void App::setTool(Tool tool) {
     if (tool_ == Tool::crop && tab() && tool != tool_) tab()->cropBox.reset();
+    if (tool != tool_) resetTransform();
     tool_ = tool;
     repaint();
 }
@@ -420,27 +442,27 @@ void App::command(Command c) {
     if (c == Command::none) return;
     if (c == Command::quit) { SendMessageW(window_, WM_CLOSE, 0, 0); return; }
     if (c == Command::open || c == Command::place) {
-        if (auto path = fileDialog(window_, false, false); !path.empty()) openPath(path, c == Command::place);
-        return;
-    }
-    if (c == Command::demo) { openDemo(); return; }
-    if (c == Command::newDoc) {
-        const std::array fields{Field{L"Name", L"Untitled " + std::to_wstring(++created_)},
-            Field{L"Width (px)", L"1920"}, Field{L"Height (px)", L"1080"}};
-        if (auto input = prompt(window_, L"New Document", fields)) {
-            const int width = readNumber((*input)[1], 1, maxEdge), height = readNumber((*input)[2], 1, maxEdge);
-            addTab({width, height, {Layer{}}}, input->front().empty() ? fields[0].value : input->front(), L"New Document");
+        if (auto path = fileDialog(window_, false, false); !path.empty()) {
+            if (t && c == Command::place) resetTransform();
+            openPath(path, c == Command::place);
         }
         return;
     }
+    if (c == Command::demo) { openDemo(); return; }
+    if (c == Command::newDoc) { createDocument(); return; }
     if (c == Command::about) {
-        MessageBoxW(window_, L"PixelForge 1.0\n\nA native raster editor for Windows.\nC++20 · Direct2D · Windows Imaging Component",
+        MessageBoxW(window_, L"PixelForge 1.1\n\nA native raster editor for Windows.\nC++20 · Direct2D · Windows Imaging Component",
             L"About PixelForge", MB_OK | MB_ICONINFORMATION);
         return;
     }
     if (c == Command::panels) { showPanels_ = !showPanels_; repaint(); return; }
     if (c == Command::rulers) { showRulers_ = !showRulers_; repaint(); return; }
+    if (c == Command::contextBar) { showContextBar_ = !showContextBar_; repaint(); return; }
     if (!t) return;
+    if (t->transform && c != Command::applyTransform && c != Command::cancelTransform &&
+        c != Command::fit && c != Command::actual && c != Command::zoomIn && c != Command::zoomOut) {
+        resetTransform();
+    }
     auto& doc = t->doc;
     auto& state = doc.edit();
     auto& l = doc.active();
@@ -462,7 +484,7 @@ void App::command(Command c) {
     case Command::close: closeTab(current_); return;
     case Command::undo: if (doc.undo()) documentChanged(); return;
     case Command::redo: if (doc.redo()) documentChanged(); return;
-    case Command::cut: if (editable()) copy(true); return;
+    case Command::cut: if (editable() && (!l.adjustment || t->mask)) copy(true); return;
     case Command::copy: copy(false); return;
     case Command::copyMerged: copy(false, true); return;
     case Command::paste: paste(); return;
@@ -470,6 +492,25 @@ void App::command(Command c) {
     case Command::actual: zoomAt(1, center); return;
     case Command::zoomIn: zoomAt(t->zoom * 1.25f, center); return;
     case Command::zoomOut: zoomAt(t->zoom / 1.25f, center); return;
+    case Command::compare:
+        t->compare = !t->compare; beforeBitmaps_.clear(); repaint(); return;
+    case Command::freeTransform: beginTransform(); return;
+    case Command::applyTransform: applyTransform(); return;
+    case Command::cancelTransform: resetTransform(); return;
+    case Command::addTone: adjustment(AdjustmentKind::tone); return;
+    case Command::addLevels: adjustment(AdjustmentKind::levels); return;
+    case Command::addHue: adjustment(AdjustmentKind::hueSaturation); return;
+    case Command::editAdjustment: adjustment(std::nullopt); return;
+    case Command::mergeVisible: case Command::flatten:
+        doc.begin(); mergeVisible(state, c == Command::flatten);
+        t->mask = false; commit(c == Command::flatten ? L"Flatten Image" : L"Merge Visible"); return;
+    case Command::resolution: {
+        int ppi = int(std::round(state.ppi));
+        const int before = ppi;
+        number(L"Resolution (PPI)", ppi, 1, 2400);
+        if (ppi != before) { doc.begin(); state.ppi = ppi; commit(L"Resolution"); }
+        return;
+    }
     case Command::selectAll: doc.selection = state.bounds(); repaint(); return;
     case Command::deselect: doc.selection.reset(); t->cropBox.reset(); repaint(); return;
     case Command::cropSelection: {
@@ -505,7 +546,7 @@ void App::command(Command c) {
         doc.begin(); rotateClockwise(state); doc.selection.reset(); t->cropBox.reset();
         fit(); commit(L"Rotate Canvas"); return;
     case Command::blur: {
-        if (!editable()) return;
+        if (!editable() || l.adjustment) return;
         int radius = 0;
         const Field field{L"Radius (1–64 px)", L"5"};
         if (auto input = prompt(window_, L"Box Blur", std::span(&field, 1))) radius = readNumber(input->front(), 1, 64);
@@ -513,13 +554,13 @@ void App::command(Command c) {
         return;
     }
     case Command::clear: case Command::fillFG: case Command::fillBG:
-        if (!editable()) return;
+        if (!editable() || (l.adjustment && !t->mask)) return;
         doc.begin();
         fill(l, clip(), c == Command::fillBG ? background_ : c == Command::clear ? 0xffffffff : foreground_,
             c == Command::clear, t->mask);
         commit(c == Command::clear ? L"Clear" : L"Fill"); return;
     case Command::invert: case Command::gray: case Command::brightness: case Command::contrast: {
-        if (!editable()) return;
+        if (!editable() || l.adjustment) return;
         const auto filter = c == Command::invert ? Filter::invert : c == Command::gray ? Filter::grayscale :
             c == Command::brightness ? Filter::brightness : Filter::contrast;
         const auto label = c == Command::invert ? L"Invert" : c == Command::gray ? L"Desaturate" :
@@ -566,9 +607,13 @@ void App::command(Command c) {
         commit(L"Reorder Layers"); return;
     }
     case Command::toggleLock: doc.begin(); l.locked = !l.locked; commit(L"Toggle Lock"); return;
-    case Command::addMask:
+    case Command::addMask: {
         if (!editable() || l.mask) return;
-        doc.begin(); l.mask.emplace(0xffffffff); t->mask = true; commit(L"Add Layer Mask"); return;
+        const Rect bounds{-l.x, -l.y, state.width, state.height};
+        auto selection = doc.selection;
+        if (selection) { selection->x -= l.x; selection->y -= l.y; }
+        doc.begin(); l.mask = maskFromSelection(bounds, selection); t->mask = true; commit(L"Add Layer Mask"); return;
+    }
     case Command::removeMask:
         if (!editable() || !l.mask) return;
         doc.begin(); l.mask.reset(); t->mask = false; commit(L"Delete Layer Mask"); return;
@@ -586,9 +631,15 @@ void App::menu(int index, Vec point, bool context) {
         const bool disabled = noDocument || (item.command == Command::undo && !tab()->doc.historyIndex()) ||
             (item.command == Command::redo && tab()->doc.historyIndex() + 1 == tab()->doc.historyCount()) ||
             (item.command == Command::paste && !IsClipboardFormatAvailable(CF_DIBV5) && !IsClipboardFormatAvailable(CF_DIB));
-        const bool checked = (item.command == Command::rulers && showRulers_) || (item.command == Command::panels && showPanels_);
+        const bool checked = (item.command == Command::rulers && showRulers_) || (item.command == Command::panels && showPanels_) ||
+            (item.command == Command::contextBar && showContextBar_) || (item.command == Command::compare && tab() && tab()->compare);
         AppendMenuW(popup, MF_STRING | (disabled ? MF_GRAYED : 0) | (checked ? MF_CHECKED : 0),
             UINT_PTR(item.command), item.label);
+    }
+    if (index == 3) {
+        const auto child = CreatePopupMenu();
+        for (const auto& item : adjustmentsMenu) AppendMenuW(child, MF_STRING, UINT_PTR(item.command), item.label);
+        InsertMenuW(popup, 1, MF_BYPOSITION | MF_POPUP | (tab() ? 0 : MF_GRAYED), reinterpret_cast<UINT_PTR>(child), L"New Adjustment Layer");
     }
     POINT screen{LONG(point.x * dpi_), LONG(point.y * dpi_)};
     ClientToScreen(window_, &screen);
@@ -638,6 +689,14 @@ void App::inputTarget(const Target& hit, Vec p) {
     case Hit::flow: number(L"Opacity (%)", flow_, 1, 100); break;
     case Hit::typeSize: number(L"Type Size (px)", typeSize_, 6, 800); break;
     case Hit::tolerance: number(L"Tolerance", tolerance_, 0, 255); break;
+    case Hit::cloneSample: cloneMerged_ = !cloneMerged_; repaint(); break;
+    case Hit::transformSize: if (t && t->transform) transformNumber(false); break;
+    case Hit::transformAngle: if (t && t->transform) transformNumber(true); break;
+    case Hit::transformLink: if (t && t->transform) { t->transform->linked = !t->transform->linked; repaint(); } break;
+    case Hit::properties: colorTab_ = 2; repaint(); break;
+    case Hit::compareSlider:
+        drag_ = Drag::compare;
+        SetCapture(window_); moveMouse(p); break;
     case Hit::fit: fit(); break;
     case Hit::undo: command(Command::undo); break;
     case Hit::redo: command(Command::redo); break;
@@ -654,11 +713,12 @@ void App::inputTarget(const Target& hit, Vec p) {
         break;
     }
     case Hit::layer:
-        t->doc.select(hit.id); t->mask = false;
+        t->doc.select(hit.id); t->mask = false; resetTransform();
         drag_ = Drag::layerRow; draggedLayer_ = dropLayer_ = hit.id; down_ = p;
         SetCapture(window_); repaint(); break;
     case Hit::eye: case Hit::lock: {
         auto& doc = t->doc;
+        if (hit.kind == Hit::lock && hit.id == doc.state().active) resetTransform();
         doc.begin();
         auto& layer = doc.edit().layers[hit.id];
         if (hit.kind == Hit::eye) layer.visible = !layer.visible;
@@ -667,8 +727,8 @@ void App::inputTarget(const Target& hit, Vec p) {
         documentChanged();
         break;
     }
-    case Hit::mask: t->doc.select(hit.id); t->mask = true; repaint(); break;
-    case Hit::history: if (t->doc.jump(hit.id)) { t->mask = false; documentChanged(); } break;
+    case Hit::mask: t->doc.select(hit.id); t->mask = true; resetTransform(); repaint(); break;
+    case Hit::history: if (t->doc.jump(hit.id)) { t->mask = false; resetTransform(); documentChanged(); } break;
     case Hit::panel: sidebarTab_ = hit.id; repaint(); break;
     case Hit::colorTab: colorTab_ = hit.id; repaint(); break;
     case Hit::saturation: case Hit::hue:
@@ -704,12 +764,18 @@ void App::leftDown(Vec p, bool middle) {
     down_ = last_ = p;
     anchor_ = imagePoint(p);
     const bool onImage = doc.state().bounds().contains(anchor_);
-    if (middle || space_ || tool_ == Tool::hand) {
+    if (middle || space_ || (tool_ == Tool::hand && !t->transform)) {
         drag_ = Drag::pan; panStart_ = t->pan;
+    } else if (t->transform) {
+        if (!startTransformDrag(p)) return;
     } else if (tool_ == Tool::zoom) {
         zoomAt(t->zoom * ((alt() || zoomOutMode_) ? 0.8f : 1.25f), p); return;
     } else if (!onImage) {
         if (tool_ == Tool::marquee) command(Command::deselect);
+        return;
+    } else if (tool_ == Tool::clone && alt()) {
+        t->cloneSource = anchor_;
+        repaint();
         return;
     } else if (tool_ == Tool::picker || (tool_ == Tool::brush && alt())) {
         std::array<Pixel, 1> color{};
@@ -735,16 +801,19 @@ void App::leftDown(Vec p, bool middle) {
         }
         return;
     } else {
-        if (doc.active().locked) { MessageBeep(MB_ICONWARNING); return; }
+        if (doc.active().locked || (doc.active().adjustment &&
+            (!t->mask || (tool_ != Tool::brush && tool_ != Tool::eraser && tool_ != Tool::bucket && tool_ != Tool::gradient))) ||
+            (tool_ == Tool::clone && (!t->cloneSource || t->mask))) { MessageBeep(MB_ICONWARNING); return; }
         doc.begin();
-        if (tool_ == Tool::brush || tool_ == Tool::eraser) {
+        if (tool_ == Tool::brush || tool_ == Tool::eraser || tool_ == Tool::clone) {
             drag_ = Drag::paint;
             strokeCarry_ = 0;
             const auto v = screenToImage(p);
             lastStamp_ = {v.x, v.y};
-            Brush brush{foreground_, float(brushSize_), hardness_ / 100.0f, flow_ / 100.0f,
-                tool_ == Tool::eraser, t->mask};
-            invalidate(stamp(doc.active(), clip(), v.x, v.y, brush));
+            if (tool_ == Tool::clone) cloneOffset_ = {t->cloneSource->x - anchor_.x, t->cloneSource->y - anchor_.y};
+            Rect dirty;
+            dab(v.x, v.y, dirty);
+            invalidate(dirty);
         } else if (tool_ == Tool::move) {
             drag_ = Drag::move; moveStart_ = {doc.active().x, doc.active().y};
         } else if (tool_ == Tool::bucket) {
@@ -758,20 +827,17 @@ void App::leftDown(Vec p, bool middle) {
     repaint();
 }
 void App::stroke(Vec p) {
-    auto& d = tab()->doc;
     const auto from = screenToImage(last_);
     const auto to = screenToImage(p);
-    const auto area = clip();
-    Brush brush{foreground_, float(brushSize_), hardness_ / 100.0f, flow_ / 100.0f, tool_ == Tool::eraser, tab()->mask};
     const float distance = std::hypot(to.x - from.x, to.y - from.y);
-    const float spacing = std::max(0.5f, brush.diameter * 0.14f);
+    const float spacing = std::max(0.5f, brushSize_ * 0.14f);
     Rect dirty;
     if (distance > 0) {
         float at = spacing - strokeCarry_;
         for (; at <= distance; at += spacing) {
             const float t = at / distance;
             lastStamp_ = {from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t};
-            dirty = unite(dirty, stamp(d.active(), area, lastStamp_.x, lastStamp_.y, brush));
+            dab(lastStamp_.x, lastStamp_.y, dirty);
         }
         strokeCarry_ = distance - (at - spacing);
     }
@@ -786,7 +852,8 @@ void App::moveMouse(Vec p) {
         overWindow_ = true;
     }
     if (drag_ == Drag::none) SetTimer(window_, 1, 620, nullptr);
-    const auto cursor = drag_ == Drag::pan || (inside(viewport_, p) && (space_ || tool_ == Tool::hand)) ? IDC_HAND :
+    const auto cursor = drag_ == Drag::compare ? IDC_SIZEWE : drag_ == Drag::transform ? IDC_SIZEALL :
+        drag_ == Drag::pan || (inside(viewport_, p) && (space_ || tool_ == Tool::hand)) ? IDC_HAND :
         inside(viewport_, p) && tab() && tool_ != Tool::move && tool_ != Tool::brush && tool_ != Tool::eraser ?
         (tool_ == Tool::type ? IDC_IBEAM : IDC_CROSS) : IDC_ARROW;
     SetCursor(LoadCursorW(nullptr, cursor));
@@ -797,6 +864,13 @@ void App::moveMouse(Vec p) {
         t->pan = {panStart_.x + p.x - down_.x, panStart_.y + p.y - down_.y};
     } else if (drag_ == Drag::paint) {
         stroke(p);
+    } else if (drag_ == Drag::transform && t->transform) {
+        dragTransform(p);
+        bitmaps_.clear();
+    } else if (drag_ == Drag::compare) {
+        const auto image = imageRect();
+        const float left = std::max(image.left, viewport_.left), right = std::min(image.right, viewport_.right);
+        if (right > left) t->split = std::clamp((p.x - left) / (right - left), 0.03f, 0.97f);
     } else if (drag_ == Drag::move) {
         auto& l = t->doc.active();
         const auto q = imagePoint(p);
@@ -832,11 +906,11 @@ void App::leftUp(Vec p) {
     case Drag::paint: {
         const auto v = screenToImage(p);
         if (std::hypot(lastStamp_.x - v.x, lastStamp_.y - v.y) > 0.5f) {
-            Brush brush{foreground_, float(brushSize_), hardness_ / 100.0f, flow_ / 100.0f,
-                tool_ == Tool::eraser, t->mask};
-            invalidate(stamp(d.active(), clip(), v.x, v.y, brush));
+            Rect dirty;
+            dab(v.x, v.y, dirty);
+            invalidate(dirty);
         }
-        d.commit(tool_ == Tool::eraser ? L"Eraser" : L"Brush Stroke");
+        d.commit(tool_ == Tool::eraser ? L"Eraser" : tool_ == Tool::clone ? L"Clone Stamp" : L"Brush Stroke");
         thumbs_.clear(); documentChanged(false); break;
     }
     case Drag::move: d.commit(L"Move Layer"); documentChanged(); break;
@@ -868,21 +942,32 @@ void App::leftUp(Vec p) {
     repaint();
 }
 void App::cancelDrag() {
-    drag_ = Drag::none;
+    const auto drag = std::exchange(drag_, Drag::none);
     if (GetCapture() == window_) ReleaseCapture();
-    if (tab()) tab()->doc.cancel();
+    if (tab()) {
+        tab()->doc.cancel();
+        if (drag == Drag::transform && tab()->transform) tab()->transform = transformStart_;
+    }
     gesture_.reset();
     documentChanged();
 }
 bool App::key(WPARAM key) {
     if (key == VK_ESCAPE) {
-        if (drag_ != Drag::none) cancelDrag();
+        if (drag_ != Drag::none) {
+            const bool transform = drag_ == Drag::transform;
+            cancelDrag();
+            if (transform) resetTransform();
+            return true;
+        }
+        if (tab() && tab()->transform) resetTransform();
         else if (tab() && tab()->cropBox) { tab()->cropBox.reset(); repaint(); }
+        else if (tab() && tab()->compare) { command(Command::compare); }
         else command(Command::deselect);
         return true;
     }
     if (key == VK_SPACE) { space_ = true; return true; }
     if (drag_ != Drag::none) return false;
+    if (key == VK_RETURN && tab() && tab()->transform) { command(Command::applyTransform); return true; }
     if (key == VK_RETURN && tab() && tab()->cropBox) { command(Command::cropSelection); return true; }
     if (control() && key == VK_TAB && !tabs_.empty()) {
         switchTab((current_ + (shift() ? tabs_.size() - 1 : 1)) % tabs_.size()); return true;
@@ -906,6 +991,8 @@ bool App::key(WPARAM key) {
         case 'I': c = alternate ? Command::resize : Command::invert; break;
         case 'U': if (shifted) c = Command::gray; break;
         case 'R': c = Command::rulers; break;
+        case 'T': c = Command::freeTransform; break;
+        case 'E': if (shifted) c = Command::mergeVisible; break;
         case '0': c = Command::fit; break;
         case '1': c = Command::actual; break;
         case VK_BACK: c = Command::fillBG; break;
@@ -920,13 +1007,23 @@ bool App::key(WPARAM key) {
     } else {
         if (key == VK_TAB) c = Command::panels;
         if (key == VK_DELETE) c = Command::clear;
+        if (key == VK_OEM_5 || key == VK_OEM_102) c = Command::compare;
         if (key == 'X') { std::swap(foreground_, background_); updateHSV(); repaint(); return true; }
         if (key == 'D') { foreground_ = rgba(0, 0, 0); background_ = rgba(255, 255, 255); updateHSV(); repaint(); return true; }
         if (key == VK_OEM_4 || key == VK_OEM_6) {
             const int n = std::max(1, brushSize_ / 8);
             brushSize_ = std::clamp(brushSize_ + (key == VK_OEM_4 ? -n : n), 1, 2000); repaint(); return true;
         }
-        if (key >= VK_LEFT && key <= VK_DOWN && tab() && tool_ == Tool::move && !tab()->doc.active().locked) {
+        if (key >= VK_LEFT && key <= VK_DOWN && tab() && tab()->transform) {
+            auto& area = tab()->transform->box;
+            const int delta = shifted ? 10 : 1;
+            area.x = std::clamp(area.x + (key == VK_LEFT ? -delta : key == VK_RIGHT ? delta : 0), -maxEdge * 4, maxEdge * 4);
+            area.y = std::clamp(area.y + (key == VK_UP ? -delta : key == VK_DOWN ? delta : 0), -maxEdge * 4, maxEdge * 4);
+            bitmaps_.clear();
+            repaint(); return true;
+        }
+        if (key >= VK_LEFT && key <= VK_DOWN && tab() && tool_ == Tool::move &&
+            !tab()->doc.active().locked && !tab()->doc.active().adjustment) {
             auto& d = tab()->doc;
             d.begin();
             const int delta = shifted ? 10 : 1;
